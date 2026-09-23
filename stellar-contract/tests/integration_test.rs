@@ -4,7 +4,7 @@ use prediction_market::{Error, PredictionMarket, PredictionMarketClient};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _},
-    vec, Address, Env, IntoVal, String,
+    token, vec, Address, BytesN, Env, IntoVal, String,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -17,8 +17,42 @@ fn setup() -> (Env, PredictionMarketClient<'static>, Address, Address, Address) 
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let oracle = Address::generate(&env);
-    client.init(&admin, &treasury);
+    // Tests below that don't move real collateral (everything except
+    // dispute/split/merge) don't need to observe this token, so a throwaway
+    // address here keeps every pre-existing call site untouched. Tests that
+    // do need to fund/transfer real collateral use `setup_with_token()`.
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin);
+    client.init(&admin, &treasury, &token_id);
     (env, client, admin, treasury, oracle)
+}
+
+/// Like `setup()`, but also returns a live token client + its Stellar Asset
+/// Contract admin client so a test can mint collateral to users before
+/// calling `split`, `merge`, or `dispute` — all three now require real 1:1
+/// token transfers (#1258, #1260).
+fn setup_with_token() -> (
+    Env,
+    PredictionMarketClient<'static>,
+    Address,
+    Address,
+    Address,
+    token::Client<'static>,
+    token::StellarAssetClient<'static>,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PredictionMarket);
+    let client = PredictionMarketClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let token = token::Client::new(&env, &token_id);
+    let token_sac = token::StellarAssetClient::new(&env, &token_id);
+    client.init(&admin, &treasury, &token_id);
+    (env, client, admin, treasury, oracle, token, token_sac)
 }
 
 fn question(env: &Env) -> String {
@@ -69,9 +103,11 @@ fn test_happy_path_full_lifecycle() {
 
 #[test]
 fn test_dispute_admin_upholds_emergency_resolve() {
-    let (env, client, admin, _treasury, oracle) = setup();
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
     let user = Address::generate(&env);
     let disputer = Address::generate(&env);
+    let bond = 10_000_000i128; // == MIN_DISPUTE_BOND
+    token_sac.mint(&disputer, &bond);
 
     let mid = client.create_market(&admin, &question(&env), &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
@@ -79,8 +115,9 @@ fn test_dispute_admin_upholds_emergency_resolve() {
     client.close_market(&admin, &mid);
     client.oracle_report(&oracle, &mid, &false); // oracle says NO
 
-    // disputer challenges
-    client.dispute(&disputer, &mid, &50_000);
+    // disputer challenges, escrowing the bond into the contract
+    client.dispute(&disputer, &mid, &bond);
+    assert_eq!(token.balance(&disputer), 0);
 
     // admin upholds → flips to YES
     client.admin_uphold_dispute(&admin, &mid, &true);
@@ -97,20 +134,22 @@ fn test_dispute_admin_upholds_emergency_resolve() {
 
 #[test]
 fn test_dispute_rejected_bond_slashed_to_treasury() {
-    let (env, client, admin, _treasury, oracle) = setup();
+    let (env, client, admin, _treasury, oracle, _token, token_sac) = setup_with_token();
     let disputer = Address::generate(&env);
+    let bond = 10_000_000i128; // == MIN_DISPUTE_BOND
+    token_sac.mint(&disputer, &bond);
 
     let mid = client.create_market(&admin, &question(&env), &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
     client.close_market(&admin, &mid);
     client.oracle_report(&oracle, &mid, &true);
-    client.dispute(&disputer, &mid, &50_000);
+    client.dispute(&disputer, &mid, &bond);
 
     // admin rejects → bond slashed
     client.admin_reject_dispute(&admin, &mid);
 
     let treasury_bal = client.get_treasury_balance();
-    assert_eq!(treasury_bal, 50_000);
+    assert_eq!(treasury_bal, bond);
 
     // market reverts to Closed → can finalize
     client.finalize(&mid);
@@ -337,24 +376,73 @@ fn test_batch_redeem_partial_failure() {
 
 #[test]
 fn test_split_sell_half_merge_remaining() {
-    let (env, client, admin, _treasury, oracle) = setup();
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
     let user = Address::generate(&env);
+    token_sac.mint(&user, &200_000);
 
     let mid = client.create_market(&admin, &question(&env), &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
 
-    // split: get YES + NO shares for collateral
+    // split: 1:1 collateral is pulled from the user into contract escrow
     client.split(&user, &mid, &200_000);
+    assert_eq!(token.balance(&user), 0);
+    assert_eq!(token.balance(&client.address), 200_000);
     let pos = client.get_position(&mid, &user);
     assert_eq!(pos.yes_shares, 200_000);
     assert_eq!(pos.no_shares, 200_000);
 
     // "sell half" — simulate by buying more on the other side (no sell fn needed)
-    // merge remaining half
+    // merge remaining half → 1:1 collateral is returned to the user
     client.merge(&user, &mid, &100_000);
+    assert_eq!(token.balance(&user), 100_000);
+    assert_eq!(token.balance(&client.address), 100_000);
     let pos2 = client.get_position(&mid, &user);
     assert_eq!(pos2.yes_shares, 100_000);
     assert_eq!(pos2.no_shares, 100_000);
+}
+
+// ── 7b. Split/merge collateral enforcement (#1260) ───────────────────────────
+
+#[test]
+fn test_split_requires_positive_amount() {
+    let (env, client, admin, _treasury, oracle, _token, _token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+
+    let err = client.try_split(&user, &mid, &0).unwrap_err().unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+
+    let err = client.try_split(&user, &mid, &-1).unwrap_err().unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+}
+
+#[test]
+#[should_panic]
+fn test_split_fails_without_sufficient_collateral() {
+    let (env, client, admin, _treasury, oracle, _token, token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &100); // less than the amount they'll try to split
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+
+    // The token transfer traps on insufficient balance before any shares
+    // are minted — uncollateralized share minting is impossible.
+    client.split(&user, &mid, &1_000);
+}
+
+#[test]
+fn test_merge_returns_collateral_only_up_to_split_tokens() {
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &500_000);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+
+    client.split(&user, &mid, &500_000);
+    assert_eq!(token.balance(&client.address), 500_000);
+
+    client.merge(&user, &mid, &500_000);
+    assert_eq!(token.balance(&user), 500_000, "full collateral returned 1:1");
+    assert_eq!(token.balance(&client.address), 0);
 }
 
 // ── 8. Slippage exceeded ──────────────────────────────────────────────────────
@@ -485,4 +573,166 @@ fn test_finalize_emits_resolved_event() {
         ]
     );
     assert_eq!(data, (mid, Some(true)).into_val(&env));
+}
+
+// ── 11. Emergency upgrade & market containment (#1259) ────────────────────────
+
+#[test]
+fn test_upgrade_rejects_non_admin() {
+    let (env, client, _admin, _treasury, _oracle) = setup();
+    let attacker = Address::generate(&env);
+    let fake_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    // Non-admin is rejected before the deployer is ever touched. A full
+    // successful WASM-swap round trip requires a second compiled contract
+    // binary uploaded via the deployer, which isn't available in this unit
+    // test crate — that path is exercised in deployment/integration testing
+    // outside `cargo test`, not here.
+    let err = client.try_upgrade(&attacker, &fake_hash).unwrap_err().unwrap();
+    assert_eq!(err, Error::Unauthorized);
+}
+
+#[test]
+fn test_emergency_drain_market_rejects_non_admin() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let attacker = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+
+    let err = client
+        .try_emergency_drain_market(&attacker, &mid)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+
+    // Rejected call must not have touched the market.
+    let market = client.get_market(&mid);
+    assert_eq!(market.status, prediction_market::MarketStatus::Open);
+}
+
+#[test]
+fn test_emergency_drain_market_cancels_and_preserves_storage() {
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &300_000);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.split(&user, &mid, &300_000);
+
+    // Admin-gated emergency containment.
+    client.emergency_drain_market(&admin, &mid);
+    let market = client.get_market(&mid);
+    assert_eq!(market.status, prediction_market::MarketStatus::Cancelled);
+    // Unrelated market fields survive the drain untouched.
+    assert_eq!(market.creator, admin);
+    assert_eq!(market.question, question(&env));
+
+    // Holders recover their position through the existing cancelled-market
+    // refund path, including real collateral for the split-originated shares.
+    let refund = client.redeem(&user, &mid);
+    assert_eq!(refund, 600_000); // 300_000 yes + 300_000 no shares, 1:1
+    assert_eq!(token.balance(&user), 300_000);
+    assert_eq!(token.balance(&client.address), 0);
+
+    // Draining an already-cancelled market fails cleanly instead of
+    // double-cancelling.
+    let err = client
+        .try_emergency_drain_market(&admin, &mid)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketAlreadyCancelled);
+}
+
+// ── 12. Redeem payout precision & dust routing (#1257) ────────────────────────
+
+#[test]
+fn test_redeem_precision_dust_flushes_to_lp_fees_with_exact_conservation() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let buyer_a = Address::generate(&env);
+    let buyer_b = Address::generate(&env);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    // Fresh, unseeded market: the first buy lands on calc_shares' 0/0
+    // bootstrap branch (shares == amount), so pool/share state — and thus
+    // the exact payout math below — is fully predictable.
+    let shares_a = client.buy_yes(&buyer_a, &mid, &3, &1);
+    assert_eq!(shares_a, 3);
+    let shares_b = client.buy_yes(&buyer_b, &mid, &4, &1);
+    // shares_b = 4 * (0 + 3) / (3 + 4) = 12 / 7 = 1 (truncated) — a
+    // deliberately non-evenly-divisible share split.
+    assert_eq!(shares_b, 1);
+
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+    client.finalize(&mid);
+
+    let market = client.get_market(&mid);
+    let total_pool = market.yes_pool + market.no_pool;
+    let total_winning = market.yes_shares;
+    assert_eq!(total_pool, 7);
+    assert_eq!(total_winning, 4);
+
+    let payout_a = client.redeem(&buyer_a, &mid);
+    let payout_b = client.redeem(&buyer_b, &mid);
+
+    // Exact payouts, independently computed with the same PRECISION-scaled
+    // single-division formula the contract uses internally.
+    assert_eq!(payout_a, 5); // (3 * 10_000_000 * 7) / 4 / 10_000_000 = 5
+    assert_eq!(payout_b, 1); // (1 * 10_000_000 * 7) / 4 / 10_000_000 = 1
+
+    // Nothing is unaccounted for: the truncated fractions from both
+    // redemptions (2_500_000 + 7_500_000 == PRECISION) flush into exactly
+    // one whole lp_fees unit, leaving zero pending dust.
+    let market_after = client.get_market(&mid);
+    assert_eq!(market_after.lp_fees, 1);
+    assert_eq!(market_after.dust, 0);
+
+    // Conservation invariant: every unit of the pool ends up either paid
+    // out or routed to claimable LP fees — nothing vanishes, nothing is
+    // fabricated.
+    assert_eq!(payout_a + payout_b + market_after.lp_fees, total_pool);
+}
+
+// ── 13. Dispute bond escrow (#1258) ───────────────────────────────────────────
+
+#[test]
+fn test_dispute_rejects_bond_below_minimum() {
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
+    let disputer = Address::generate(&env);
+    token_sac.mint(&disputer, &10_000_000);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+
+    // Below MIN_DISPUTE_BOND (10_000_000) → rejected before any token
+    // transfer is attempted, and the disputer's balance is untouched.
+    let err = client
+        .try_dispute(&disputer, &mid, &9_999_999)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+    assert_eq!(token.balance(&disputer), 10_000_000);
+
+    let market = client.get_market(&mid);
+    assert_eq!(market.status, prediction_market::MarketStatus::Closed);
+}
+
+#[test]
+#[should_panic]
+fn test_dispute_fails_without_sufficient_balance() {
+    let (env, client, admin, _treasury, oracle, _token, token_sac) = setup_with_token();
+    let disputer = Address::generate(&env);
+    // Funded below the bond they'll attempt to post.
+    token_sac.mint(&disputer, &5_000_000);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+
+    // Bond clears MIN_DISPUTE_BOND but exceeds the disputer's real balance —
+    // the token transfer traps before the market is marked Disputed.
+    client.dispute(&disputer, &mid, &10_000_000);
 }
