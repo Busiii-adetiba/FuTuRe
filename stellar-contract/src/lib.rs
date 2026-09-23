@@ -11,6 +11,12 @@ const PAUSED: Symbol = symbol_short!("PAUSED");
 const MKT_CNT: Symbol = symbol_short!("MKT_CNT");
 const TREASURY: Symbol = symbol_short!("TREASURY");
 
+/// Upper bound on the number of markets `batch_redeem` will process in one
+/// call. Each redemption performs several storage reads/writes and emits an
+/// event, so an unbounded batch can exhaust the Soroban CPU/memory budget and
+/// abort the whole transaction.
+pub const MAX_BATCH_REDEEM_SIZE: u32 = 20;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -98,6 +104,7 @@ pub enum Error {
     DisputeWindowOpen = 13,
     NothingToRedeem = 14,
     InvalidAmount = 15,
+    ArithmeticOverflow = 16,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -179,8 +186,8 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
-        market.yes_pool += amount;
-        market.no_pool += amount;
+        market.yes_pool = Self::checked_add(market.yes_pool, amount)?;
+        market.no_pool = Self::checked_add(market.no_pool, amount)?;
         Self::save_market(&env, market_id, &market);
         Self::emit(&env, symbol_short!("seeded"), (market_id, caller, amount));
         Ok(())
@@ -326,15 +333,18 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
-        let shares = Self::calc_shares(amount, market.yes_pool, market.no_pool);
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let shares = Self::calc_shares(amount, market.yes_pool, market.no_pool)?;
         if shares < min_shares_out {
             return Err(Error::SlippageExceeded);
         }
-        market.yes_pool += amount;
-        market.yes_shares += shares;
-        Self::save_market(&env, market_id, &market);
+        market.yes_pool = Self::checked_add(market.yes_pool, amount)?;
+        market.yes_shares = Self::checked_add(market.yes_shares, shares)?;
         let mut pos = Self::load_position(&env, market_id, &buyer);
-        pos.yes_shares += shares;
+        pos.yes_shares = Self::checked_add(pos.yes_shares, shares)?;
+        Self::save_market(&env, market_id, &market);
         Self::save_position(&env, market_id, &buyer, &pos);
         Self::emit(
             &env,
@@ -355,15 +365,18 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
-        let shares = Self::calc_shares(amount, market.no_pool, market.yes_pool);
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let shares = Self::calc_shares(amount, market.no_pool, market.yes_pool)?;
         if shares < min_shares_out {
             return Err(Error::SlippageExceeded);
         }
-        market.no_pool += amount;
-        market.no_shares += shares;
-        Self::save_market(&env, market_id, &market);
+        market.no_pool = Self::checked_add(market.no_pool, amount)?;
+        market.no_shares = Self::checked_add(market.no_shares, shares)?;
         let mut pos = Self::load_position(&env, market_id, &buyer);
-        pos.no_shares += shares;
+        pos.no_shares = Self::checked_add(pos.no_shares, shares)?;
+        Self::save_market(&env, market_id, &market);
         Self::save_position(&env, market_id, &buyer, &pos);
         Self::emit(
             &env,
@@ -420,6 +433,9 @@ impl PredictionMarket {
     /// Returns per-market success/failure information instead of silently skipping failed markets.
     pub fn batch_redeem(env: Env, redeemer: Address, market_ids: Vec<u32>) -> Result<BatchRedeemResult, Error> {
         redeemer.require_auth();
+        if market_ids.len() > MAX_BATCH_REDEEM_SIZE {
+            return Err(Error::InvalidAmount);
+        }
         let mut successes: Vec<RedeemOutcome> = Vec::new();
         let mut failures: Vec<RedeemFailure> = Vec::new();
         let mut total_payout: i128 = 0;
@@ -470,17 +486,19 @@ impl PredictionMarket {
         let lp_shares = if market.lp_pool == 0 || market.total_lp_shares == 0 {
             amount
         } else {
-            (amount * market.total_lp_shares) / market.lp_pool
+            amount
+                .checked_mul(market.total_lp_shares)
+                .ok_or(Error::ArithmeticOverflow)?
+                / market.lp_pool
         };
 
-        market.lp_pool += amount;
-        market.total_lp_shares += lp_shares;
-        market.yes_pool += amount / 2;
-        market.no_pool += amount / 2;
-        Self::save_market(&env, market_id, &market);
-
+        market.lp_pool = Self::checked_add(market.lp_pool, amount)?;
+        market.total_lp_shares = Self::checked_add(market.total_lp_shares, lp_shares)?;
+        market.yes_pool = Self::checked_add(market.yes_pool, amount / 2)?;
+        market.no_pool = Self::checked_add(market.no_pool, amount / 2)?;
         let mut pos = Self::load_position(&env, market_id, &provider);
-        pos.lp_shares += lp_shares;
+        pos.lp_shares = Self::checked_add(pos.lp_shares, lp_shares)?;
+        Self::save_market(&env, market_id, &market);
         Self::save_position(&env, market_id, &provider, &pos);
         Self::emit_liquidity(
             &env,
@@ -668,16 +686,24 @@ impl PredictionMarket {
         Ok(())
     }
 
-    fn calc_shares(amount: i128, own_pool: i128, other_pool: i128) -> i128 {
+    fn calc_shares(amount: i128, own_pool: i128, other_pool: i128) -> Result<i128, Error> {
         // Simple CPMM: shares = amount * other_pool / (own_pool + amount)
         if own_pool == 0 && other_pool == 0 {
-            return amount;
+            return Ok(amount);
         }
-        let denom = own_pool + amount;
+        let denom = Self::checked_add(own_pool, amount)?;
         if denom == 0 {
-            return 0;
+            return Ok(0);
         }
-        (amount * (other_pool + own_pool)) / denom
+        let total_pool = Self::checked_add(other_pool, own_pool)?;
+        let numer = amount
+            .checked_mul(total_pool)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(numer / denom)
+    }
+
+    fn checked_add(a: i128, b: i128) -> Result<i128, Error> {
+        a.checked_add(b).ok_or(Error::ArithmeticOverflow)
     }
 
     fn market_key(env: &Env, id: u32) -> soroban_sdk::Val {
@@ -734,3 +760,6 @@ impl PredictionMarket {
         Ok(refund)
     }
 }
+
+#[cfg(test)]
+mod test;
