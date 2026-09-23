@@ -3,7 +3,7 @@
 use prediction_market::{Error, PredictionMarket, PredictionMarketClient};
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     vec, Address, Env, IntoVal, String,
 };
 
@@ -19,6 +19,11 @@ fn setup() -> (Env, PredictionMarketClient<'static>, Address, Address, Address) 
     let oracle = Address::generate(&env);
     client.init(&admin, &treasury);
     (env, client, admin, treasury, oracle)
+}
+
+fn pass_dispute_window(env: &Env) {
+    env.ledger()
+        .with_mut(|li| li.timestamp += prediction_market::DISPUTE_WINDOW_SECONDS);
 }
 
 fn question(env: &Env) -> String {
@@ -54,6 +59,7 @@ fn test_happy_path_full_lifecycle() {
     client.oracle_report(&oracle, &mid, &true);
 
     // dispute window passes → finalize
+    pass_dispute_window(&env);
     client.finalize(&mid);
 
     // redeem YES position
@@ -113,6 +119,7 @@ fn test_dispute_rejected_bond_slashed_to_treasury() {
     assert_eq!(treasury_bal, 50_000);
 
     // market reverts to Closed → can finalize
+    pass_dispute_window(&env);
     client.finalize(&mid);
     let market = client.get_market(&mid);
     assert_eq!(market.status, prediction_market::MarketStatus::Resolved);
@@ -290,6 +297,7 @@ fn test_batch_redeem_across_three_markets() {
         client.buy_yes(&user, &mid, &100_000, &1);
         client.close_market(&admin, &mid);
         client.oracle_report(&oracle, &mid, &true);
+        pass_dispute_window(&env);
         client.finalize(&mid);
         ids.push_back(mid);
     }
@@ -312,6 +320,7 @@ fn test_batch_redeem_partial_failure() {
     client.buy_yes(&user, &mid1, &100_000, &1);
     client.close_market(&admin, &mid1);
     client.oracle_report(&oracle, &mid1, &true);
+    pass_dispute_window(&env);
     client.finalize(&mid1);
     ids.push_back(mid1);
 
@@ -321,6 +330,7 @@ fn test_batch_redeem_partial_failure() {
     client.buy_yes(&user, &mid2, &100_000, &1);
     client.close_market(&admin, &mid2);
     client.oracle_report(&oracle, &mid2, &false);
+    pass_dispute_window(&env);
     client.finalize(&mid2);
     ids.push_back(mid2);
 
@@ -472,6 +482,7 @@ fn test_finalize_emits_resolved_event() {
     client.buy_yes(&user, &mid, &100_000, &1);
     client.close_market(&admin, &mid);
     client.oracle_report(&oracle, &mid, &true);
+    pass_dispute_window(&env);
     client.finalize(&mid);
 
     let events = env.events().all();
@@ -485,4 +496,145 @@ fn test_finalize_emits_resolved_event() {
         ]
     );
     assert_eq!(data, (mid, Some(true)).into_val(&env));
+}
+
+// ── Dispute window enforcement (#1251) ────────────────────────────────────────
+
+#[test]
+fn test_finalize_rejected_during_dispute_window() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let disputer = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+
+    let err = client.try_finalize(&mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::DisputeWindowOpen);
+
+    // One second before expiry: still open, and still disputable.
+    env.ledger()
+        .with_mut(|li| li.timestamp += prediction_market::DISPUTE_WINDOW_SECONDS - 1);
+    let err = client.try_finalize(&mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::DisputeWindowOpen);
+    client.dispute(&disputer, &mid, &10);
+    client.admin_reject_dispute(&admin, &mid);
+
+    env.ledger().with_mut(|li| li.timestamp += 1);
+    client.finalize(&mid);
+    assert_eq!(
+        client.get_market(&mid).status,
+        prediction_market::MarketStatus::Resolved
+    );
+}
+
+// ── Upheld dispute refunds bond (#1252) ───────────────────────────────────────
+
+#[test]
+fn test_uphold_dispute_refunds_bond() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let disputer = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &false);
+    client.dispute(&disputer, &mid, &50_000);
+
+    assert_eq!(client.get_bond_refund(&disputer), 0);
+    client.admin_uphold_dispute(&admin, &mid, &true);
+
+    assert_eq!(client.get_bond_refund(&disputer), 50_000);
+    assert_eq!(client.get_treasury_balance(), 0);
+    let market = client.get_market(&mid);
+    assert_eq!(market.dispute_bond, 0);
+    assert!(market.disputer.is_none());
+}
+
+// ── LP fee accumulator (#1253) ────────────────────────────────────────────────
+
+fn two_equal_lps() -> (Env, PredictionMarketClient<'static>, Address, u32, Address, Address) {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let lp_a = Address::generate(&env);
+    let lp_b = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.add_liquidity(&lp_a, &mid, &1_000);
+    client.add_liquidity(&lp_b, &mid, &1_000);
+    client.add_lp_fees(&admin, &mid, &100);
+    (env, client, admin, mid, lp_a, lp_b)
+}
+
+#[test]
+fn test_lp_fees_independent_of_claim_order() {
+    let (_env, client, _admin, mid, lp_a, lp_b) = two_equal_lps();
+    let a = client.claim_lp_fees(&lp_a, &mid);
+    let b = client.claim_lp_fees(&lp_b, &mid);
+    assert_eq!((a, b), (50, 50));
+
+    let (_env, client, _admin, mid, lp_a, lp_b) = two_equal_lps();
+    let b = client.claim_lp_fees(&lp_b, &mid);
+    let a = client.claim_lp_fees(&lp_a, &mid);
+    assert_eq!((a, b), (50, 50));
+    assert_eq!(client.get_market(&mid).lp_fees, 0);
+}
+
+#[test]
+fn test_lp_fees_cannot_be_reclaimed() {
+    let (_env, client, admin, mid, lp_a, _lp_b) = two_equal_lps();
+    assert_eq!(client.claim_lp_fees(&lp_a, &mid), 50);
+    assert_eq!(client.claim_lp_fees(&lp_a, &mid), 0);
+    client.add_lp_fees(&admin, &mid, &40);
+    assert_eq!(client.claim_lp_fees(&lp_a, &mid), 20);
+}
+
+#[test]
+fn test_new_lp_cannot_claim_historical_fees() {
+    let (env, client, _admin, mid, lp_a, _lp_b) = two_equal_lps();
+    let lp_c = Address::generate(&env);
+    client.add_liquidity(&lp_c, &mid, &1_000);
+    assert_eq!(client.claim_lp_fees(&lp_c, &mid), 0);
+    // Fees accrued before removal remain claimable.
+    let shares_a = client.get_position(&mid, &lp_a).lp_shares;
+    client.remove_liquidity(&lp_a, &mid, &shares_a);
+    assert_eq!(client.claim_lp_fees(&lp_a, &mid), 50);
+}
+
+// ── Non-positive amounts rejected (#1254) ─────────────────────────────────────
+
+#[test]
+fn test_non_positive_amounts_rejected() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+
+    for amount in [0i128, -1, -1_000_000] {
+        assert_eq!(
+            client.try_buy_yes(&user, &mid, &amount, &i128::MIN).unwrap_err().unwrap(),
+            Error::InvalidAmount
+        );
+        assert_eq!(
+            client.try_buy_no(&user, &mid, &amount, &i128::MIN).unwrap_err().unwrap(),
+            Error::InvalidAmount
+        );
+        assert_eq!(
+            client.try_seed_market(&admin, &mid, &amount).unwrap_err().unwrap(),
+            Error::InvalidAmount
+        );
+        assert_eq!(
+            client.try_add_liquidity(&user, &mid, &amount).unwrap_err().unwrap(),
+            Error::InvalidAmount
+        );
+        assert_eq!(
+            client.try_split(&user, &mid, &amount).unwrap_err().unwrap(),
+            Error::InvalidAmount
+        );
+        assert_eq!(
+            client.try_merge(&user, &mid, &amount).unwrap_err().unwrap(),
+            Error::InvalidAmount
+        );
+    }
+
+    let market = client.get_market(&mid);
+    assert_eq!(market.yes_pool, 1_000_000);
+    assert_eq!(market.no_pool, 1_000_000);
 }
