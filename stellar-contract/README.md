@@ -17,12 +17,13 @@ This contract enables decentralized prediction markets where users can:
 
 | Function | Description | Parameters |
 |----------|-------------|------------|
-| `init` | Initialize contract with admin and treasury | `admin: Address, treasury: Address` |
+| `init` | Initialize contract with admin, treasury and the SEP-41 token used as collateral | `admin: Address, treasury: Address, token: Address` |
 | `pause` | Pause all market operations (admin only) | `caller: Address` |
 | `unpause` | Resume operations (admin only) | `caller: Address` |
-| `create_market` | Create a new prediction market | `creator: Address, question: String, oracle: Address` |
-| `seed_market` | Seed initial liquidity (YES/NO pools) | `caller: Address, market_id: u32, amount: i128` |
-| `close_market` | Close market for trading | `caller: Address, market_id: u32` |
+| `create_market` | Create a new prediction market. Trading is open until `close_time`; the oracle may only report at or after `close_time` | `creator: Address, question: String, oracle: Address, close_time: u64, resolution_deadline: u64` |
+| `seed_market` | Seed initial liquidity (YES/NO pools); transfers `2 * amount` tokens into the contract | `caller: Address, market_id: u32, amount: i128` |
+| `close_market` | Close market for trading (creator after `close_time`; admin at any time) | `caller: Address, market_id: u32` |
+| `emergency_timeout_refund` | Permissionlessly cancel a market whose oracle has not reported by `resolution_deadline`; holders then refund via `redeem` | `market_id: u32` |
 | `oracle_report` | Report outcome (oracle only) | `caller: Address, market_id: u32, outcome: bool` |
 | `dispute` | Open dispute window | `disputer: Address, market_id: u32, bond: i128` |
 | `finalize` | Finalize after dispute period | `market_id: u32` |
@@ -35,6 +36,10 @@ This contract enables decentralized prediction markets where users can:
 | `claim_lp_fees` | Claim accrued LP fees | `provider: Address, market_id: u32` |
 | `split` | Split YES/NO positions | `caller: Address, market_id: u32, amount: i128` |
 | `merge` | Merge split positions | `caller: Address, market_id: u32, amount: i128` |
+
+All value-moving calls (`seed_market`, `buy_yes`, `buy_no`, `add_liquidity`, `split`) pull tokens from the caller with `token::Client::transfer`; `redeem`, `remove_liquidity`, `claim_lp_fees` and `merge` pay tokens out of contract custody.
+
+Every storage access extends the TTL of the touched entries (instance: 7-day threshold → 30 days; markets/positions: 30-day threshold → 120 days) so live markets are not archived before resolution.
 
 ### Views
 

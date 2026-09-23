@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, Map, Symbol,
-    Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, vec, Address, Env, IntoVal, Map,
+    Symbol, Val, Vec,
 };
 
 // ── Storage keys ────────────────────────────────────────────────────────────
@@ -10,6 +10,19 @@ const ADMIN: Symbol = symbol_short!("ADMIN");
 const PAUSED: Symbol = symbol_short!("PAUSED");
 const MKT_CNT: Symbol = symbol_short!("MKT_CNT");
 const TREASURY: Symbol = symbol_short!("TREASURY");
+const TOKEN: Symbol = symbol_short!("TOKEN");
+
+// ── State TTL (ledgers; ~5s per ledger → 17_280 ledgers per day) ─────────────
+
+const DAY_IN_LEDGERS: u32 = 17_280;
+/// Instance storage is extended once its TTL falls below this threshold.
+pub const INSTANCE_BUMP_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS;
+/// Instance storage TTL target after an extension.
+pub const INSTANCE_EXTEND_TO: u32 = 30 * DAY_IN_LEDGERS;
+/// Market / position entries are extended once their TTL falls below this threshold.
+pub const PERSISTENT_BUMP_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
+/// Market / position TTL target after an extension.
+pub const PERSISTENT_EXTEND_TO: u32 = 120 * DAY_IN_LEDGERS;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -45,6 +58,10 @@ pub struct Market {
     /// Total LP shares outstanding. Tracked separately from `lp_pool`
     /// so that the share/value ratio can diverge as trading changes pool value.
     pub total_lp_shares: i128,
+    /// Ledger timestamp after which trading stops and the oracle may report.
+    pub close_time: u64,
+    /// Ledger timestamp after which an unreported market can be cancelled by anyone.
+    pub resolution_deadline: u64,
 }
 
 #[contracttype]
@@ -98,6 +115,10 @@ pub enum Error {
     DisputeWindowOpen = 13,
     NothingToRedeem = 14,
     InvalidAmount = 15,
+    TradingClosed = 16,
+    MarketNotExpired = 17,
+    InvalidDeadline = 18,
+    ResolutionDeadlineNotReached = 19,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -109,14 +130,16 @@ pub struct PredictionMarket;
 impl PredictionMarket {
     // ── Admin ────────────────────────────────────────────────────────────────
 
-    pub fn init(env: Env, admin: Address, treasury: Address) -> Result<(), Error> {
+    pub fn init(env: Env, admin: Address, treasury: Address, token: Address) -> Result<(), Error> {
         if env.storage().instance().has(&ADMIN) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&ADMIN, &admin);
         env.storage().instance().set(&TREASURY, &treasury);
+        env.storage().instance().set(&TOKEN, &token);
         env.storage().instance().set(&PAUSED, &false);
         env.storage().instance().set(&MKT_CNT, &0u32);
+        Self::extend_instance(&env);
         Self::emit_admin(&env, symbol_short!("init"), (admin, treasury));
         Ok(())
     }
@@ -144,9 +167,14 @@ impl PredictionMarket {
         creator: Address,
         question: soroban_sdk::String,
         oracle: Address,
+        close_time: u64,
+        resolution_deadline: u64,
     ) -> Result<u32, Error> {
         creator.require_auth();
         Self::require_not_paused(&env)?;
+        if close_time <= env.ledger().timestamp() || resolution_deadline <= close_time {
+            return Err(Error::InvalidDeadline);
+        }
         let id: u32 = env.storage().instance().get(&MKT_CNT).unwrap_or(0);
         let market = Market {
             creator: creator.clone(),
@@ -163,6 +191,8 @@ impl PredictionMarket {
             disputer: None,
             oracle: Some(oracle.clone()),
             total_lp_shares: 0,
+            close_time,
+            resolution_deadline,
         };
         Self::save_market(&env, id, &market);
         env.storage().instance().set(&MKT_CNT, &(id + 1));
@@ -179,6 +209,11 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_trading_open(&env, &market)?;
+        Self::require_positive(amount)?;
+        // Seeding credits `amount` to both the YES and NO pools, so the
+        // contract must take custody of `2 * amount` to keep the pools backed.
+        Self::transfer_in(&env, &caller, amount * 2)?;
         market.yes_pool += amount;
         market.no_pool += amount;
         Self::save_market(&env, market_id, &market);
@@ -192,6 +227,10 @@ impl PredictionMarket {
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
         Self::require_admin_or_creator(&env, &caller, &market.creator)?;
+        // Only the admin may halt trading before the scheduled close time.
+        if env.ledger().timestamp() < market.close_time {
+            Self::require_admin(&env, &caller)?;
+        }
         market.status = MarketStatus::Closed;
         Self::save_market(&env, market_id, &market);
         Self::emit(&env, symbol_short!("closed"), (market_id, caller));
@@ -211,6 +250,9 @@ impl PredictionMarket {
         // Verify caller is the oracle
         if market.oracle != Some(caller.clone()) {
             return Err(Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < market.close_time {
+            return Err(Error::MarketNotExpired);
         }
         market.outcome = Some(outcome);
         // Status stays Closed; finalize moves it to Resolved after dispute window
@@ -274,6 +316,7 @@ impl PredictionMarket {
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         let slashed = market.dispute_bond;
         env.storage().persistent().set(&key, &(current + slashed));
+        Self::extend_persistent(&env, &key);
         market.dispute_bond = 0;
         market.disputer = None;
         // Revert to Closed so finalize can proceed
@@ -313,6 +356,27 @@ impl PredictionMarket {
         Ok(())
     }
 
+    /// Permissionless escape hatch: if the oracle has not reported by
+    /// `resolution_deadline`, anyone may cancel the market so participants can
+    /// reclaim their funds through `redeem`.
+    pub fn emergency_timeout_refund(env: Env, market_id: u32) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        let mut market = Self::load_market(&env, market_id)?;
+        if market.status != MarketStatus::Open && market.status != MarketStatus::Closed {
+            return Err(Error::MarketNotOpen);
+        }
+        if market.outcome.is_some() {
+            return Err(Error::InvalidOutcome);
+        }
+        if env.ledger().timestamp() <= market.resolution_deadline {
+            return Err(Error::ResolutionDeadlineNotReached);
+        }
+        market.status = MarketStatus::Cancelled;
+        Self::save_market(&env, market_id, &market);
+        Self::emit(&env, symbol_short!("timeout"), market_id);
+        Ok(())
+    }
+
     // ── Trading ──────────────────────────────────────────────────────────────
 
     pub fn buy_yes(
@@ -326,10 +390,13 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_trading_open(&env, &market)?;
+        Self::require_positive(amount)?;
         let shares = Self::calc_shares(amount, market.yes_pool, market.no_pool);
         if shares < min_shares_out {
             return Err(Error::SlippageExceeded);
         }
+        Self::transfer_in(&env, &buyer, amount)?;
         market.yes_pool += amount;
         market.yes_shares += shares;
         Self::save_market(&env, market_id, &market);
@@ -355,10 +422,13 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_trading_open(&env, &market)?;
+        Self::require_positive(amount)?;
         let shares = Self::calc_shares(amount, market.no_pool, market.yes_pool);
         if shares < min_shares_out {
             return Err(Error::SlippageExceeded);
         }
+        Self::transfer_in(&env, &buyer, amount)?;
         market.no_pool += amount;
         market.no_shares += shares;
         Self::save_market(&env, market_id, &market);
@@ -412,6 +482,7 @@ impl PredictionMarket {
             pos.no_shares = 0;
         }
         Self::save_position(&env, market_id, &redeemer, &pos);
+        Self::transfer_out(&env, &redeemer, payout)?;
         Self::emit(&env, symbol_short!("redeemed"), (market_id, redeemer, payout));
         Ok(payout)
     }
@@ -461,6 +532,9 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_trading_open(&env, &market)?;
+        Self::require_positive(amount)?;
+        Self::transfer_in(&env, &provider, amount)?;
 
         // Mint LP shares proportional to the provider's share of the pool value.
         // • First provider (empty pool): shares == amount (1:1 bootstrap).
@@ -519,6 +593,7 @@ impl PredictionMarket {
         pos.lp_shares -= lp_shares;
         Self::save_market(&env, market_id, &market);
         Self::save_position(&env, market_id, &provider, &pos);
+        Self::transfer_out(&env, &provider, payout)?;
         Self::emit_liquidity(
             &env,
             symbol_short!("removed"),
@@ -546,6 +621,7 @@ impl PredictionMarket {
         let fee_share = (pos.lp_shares * market.lp_fees) / total_lp;
         market.lp_fees -= fee_share;
         Self::save_market(&env, market_id, &market);
+        Self::transfer_out(&env, &provider, fee_share)?;
         Self::emit_liquidity(&env, symbol_short!("claimed"), (market_id, provider, fee_share));
         Ok(fee_share)
     }
@@ -562,6 +638,8 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_positive(amount)?;
+        Self::transfer_in(&env, &caller, amount)?;
         let mut pos = Self::load_position(&env, market_id, &caller);
         pos.yes_shares += amount;
         pos.no_shares += amount;
@@ -589,6 +667,7 @@ impl PredictionMarket {
         pos.no_shares -= amount;
         pos.split_tokens -= amount.min(pos.split_tokens);
         Self::save_position(&env, market_id, &caller, &pos);
+        Self::transfer_out(&env, &caller, amount)?;
         Self::emit(&env, symbol_short!("merged"), (market_id, caller, amount));
         Ok(())
     }
@@ -605,7 +684,16 @@ impl PredictionMarket {
 
     pub fn get_treasury_balance(env: Env) -> i128 {
         let key = Self::treasury_key(&env);
-        env.storage().persistent().get(&key).unwrap_or(0)
+        let bal = env.storage().persistent().get(&key).unwrap_or(0);
+        if bal != 0 {
+            Self::extend_persistent(&env, &key);
+        }
+        bal
+    }
+
+    pub fn get_token(env: Env) -> Result<Address, Error> {
+        Self::extend_instance(&env);
+        env.storage().instance().get(&TOKEN).ok_or(Error::NotInitialized)
     }
 
     // ── Events ───────────────────────────────────────────────────────────────
@@ -649,6 +737,7 @@ impl PredictionMarket {
     }
 
     fn require_not_paused(env: &Env) -> Result<(), Error> {
+        Self::extend_instance(env);
         let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
         if paused {
             return Err(Error::ContractPaused);
@@ -666,6 +755,54 @@ impl PredictionMarket {
             });
         }
         Ok(())
+    }
+
+    fn require_trading_open(env: &Env, market: &Market) -> Result<(), Error> {
+        if env.ledger().timestamp() >= market.close_time {
+            return Err(Error::TradingClosed);
+        }
+        Ok(())
+    }
+
+    fn require_positive(amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(())
+    }
+
+    fn token_client(env: &Env) -> Result<token::Client<'_>, Error> {
+        let token: Address = env.storage().instance().get(&TOKEN).ok_or(Error::NotInitialized)?;
+        Ok(token::Client::new(env, &token))
+    }
+
+    /// Move `amount` of the market token from `from` into contract custody.
+    /// Panics (reverting the whole invocation) if `from` lacks the balance.
+    fn transfer_in(env: &Env, from: &Address, amount: i128) -> Result<(), Error> {
+        if amount > 0 {
+            Self::token_client(env)?.transfer(from, &env.current_contract_address(), &amount);
+        }
+        Ok(())
+    }
+
+    /// Pay `amount` of the market token out of contract custody to `to`.
+    fn transfer_out(env: &Env, to: &Address, amount: i128) -> Result<(), Error> {
+        if amount > 0 {
+            Self::token_client(env)?.transfer(&env.current_contract_address(), to, &amount);
+        }
+        Ok(())
+    }
+
+    fn extend_instance(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_EXTEND_TO);
+    }
+
+    fn extend_persistent<K: IntoVal<Env, Val>>(env: &Env, key: &K) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_EXTEND_TO);
     }
 
     fn calc_shares(amount: i128, own_pool: i128, other_pool: i128) -> i128 {
@@ -687,27 +824,37 @@ impl PredictionMarket {
 
     fn load_market(env: &Env, id: u32) -> Result<Market, Error> {
         let key = (symbol_short!("MKT"), id);
-        env.storage().persistent().get(&key).ok_or(Error::MarketNotFound)
+        let market = env.storage().persistent().get(&key).ok_or(Error::MarketNotFound)?;
+        Self::extend_persistent(env, &key);
+        Ok(market)
     }
 
     fn save_market(env: &Env, id: u32, market: &Market) {
         let key = (symbol_short!("MKT"), id);
         env.storage().persistent().set(&key, market);
+        Self::extend_persistent(env, &key);
     }
 
     fn load_position(env: &Env, market_id: u32, user: &Address) -> Position {
         let key = (symbol_short!("POS"), market_id, user.clone());
-        env.storage().persistent().get(&key).unwrap_or(Position {
-            yes_shares: 0,
-            no_shares: 0,
-            lp_shares: 0,
-            split_tokens: 0,
-        })
+        match env.storage().persistent().get(&key) {
+            Some(pos) => {
+                Self::extend_persistent(env, &key);
+                pos
+            }
+            None => Position {
+                yes_shares: 0,
+                no_shares: 0,
+                lp_shares: 0,
+                split_tokens: 0,
+            },
+        }
     }
 
     fn save_position(env: &Env, market_id: u32, user: &Address, pos: &Position) {
         let key = (symbol_short!("POS"), market_id, user.clone());
         env.storage().persistent().set(&key, pos);
+        Self::extend_persistent(env, &key);
     }
 
     fn treasury_key(env: &Env) -> Symbol {
@@ -722,13 +869,17 @@ impl PredictionMarket {
         market: &Market,
     ) -> Result<i128, Error> {
         let mut pos = Self::load_position(env, market_id, redeemer);
-        let refund = pos.yes_shares + pos.no_shares; // 1:1 refund
-        if refund == 0 {
+        // 1:1 refund; a split YES+NO pair was backed by a single unit of
+        // collateral, so count it once.
+        let refund = pos.yes_shares + pos.no_shares - pos.split_tokens;
+        if refund <= 0 {
             return Err(Error::NothingToRedeem);
         }
         pos.yes_shares = 0;
         pos.no_shares = 0;
+        pos.split_tokens = 0;
         Self::save_position(env, market_id, redeemer, &pos);
+        Self::transfer_out(env, redeemer, refund)?;
         Self::emit(env, symbol_short!("refunded"), (market_id, redeemer.clone(), refund));
         let _ = market;
         Ok(refund)
