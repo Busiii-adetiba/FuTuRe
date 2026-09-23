@@ -10,6 +10,8 @@ const ADMIN: Symbol = symbol_short!("ADMIN");
 const PAUSED: Symbol = symbol_short!("PAUSED");
 const MKT_CNT: Symbol = symbol_short!("MKT_CNT");
 const TREASURY: Symbol = symbol_short!("TREASURY");
+/// Transient reentrancy lock held while a state-mutating LP/redeem call runs.
+const REENTRY: Symbol = symbol_short!("REENTRY");
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -98,6 +100,7 @@ pub enum Error {
     DisputeWindowOpen = 13,
     NothingToRedeem = 14,
     InvalidAmount = 15,
+    ReentrancyError = 16,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -377,76 +380,20 @@ impl PredictionMarket {
 
     pub fn redeem(env: Env, redeemer: Address, market_id: u32) -> Result<i128, Error> {
         redeemer.require_auth();
-        Self::require_not_paused(&env)?;
-        let market = Self::load_market(&env, market_id)?;
-        if market.status == MarketStatus::Cancelled {
-            return Self::refund_cancelled(&env, &redeemer, market_id, &market);
-        }
-        if market.status != MarketStatus::Resolved && market.status != MarketStatus::EmergencyResolved {
-            return Err(Error::MarketNotResolved);
-        }
-        let mut pos = Self::load_position(&env, market_id, &redeemer);
-        let winning_shares = match market.outcome {
-            Some(true) => pos.yes_shares,
-            Some(false) => pos.no_shares,
-            None => return Err(Error::InvalidOutcome),
-        };
-        if winning_shares == 0 {
-            return Err(Error::NothingToRedeem);
-        }
-        let total_pool = market.yes_pool + market.no_pool;
-        let total_winning = if market.outcome == Some(true) {
-            market.yes_shares
-        } else {
-            market.no_shares
-        };
-        let payout = if total_winning > 0 {
-            (winning_shares * total_pool) / total_winning
-        } else {
-            0
-        };
-        // Clear position
-        if market.outcome == Some(true) {
-            pos.yes_shares = 0;
-        } else {
-            pos.no_shares = 0;
-        }
-        Self::save_position(&env, market_id, &redeemer, &pos);
-        Self::emit(&env, symbol_short!("redeemed"), (market_id, redeemer, payout));
-        Ok(payout)
+        Self::enter_reentrancy_guard(&env)?;
+        let result = Self::redeem_inner(&env, &redeemer, market_id);
+        Self::exit_reentrancy_guard(&env);
+        result
     }
 
     /// Batch redeem across multiple markets
     /// Returns per-market success/failure information instead of silently skipping failed markets.
     pub fn batch_redeem(env: Env, redeemer: Address, market_ids: Vec<u32>) -> Result<BatchRedeemResult, Error> {
         redeemer.require_auth();
-        let mut successes: Vec<RedeemOutcome> = Vec::new();
-        let mut failures: Vec<RedeemFailure> = Vec::new();
-        let mut total_payout: i128 = 0;
-
-        for id in market_ids.iter() {
-            match Self::redeem(env.clone(), redeemer.clone(), id) {
-                Ok(payout) => {
-                    total_payout += payout;
-                    successes.push_back(RedeemOutcome {
-                        market_id: id,
-                        payout,
-                    });
-                }
-                Err(error) => {
-                    failures.push_back(RedeemFailure {
-                        market_id: id,
-                        error,
-                    });
-                }
-            }
-        }
-
-        Ok(BatchRedeemResult {
-            successes,
-            failures,
-            total_payout,
-        })
+        Self::enter_reentrancy_guard(&env)?;
+        let result = Self::batch_redeem_inner(&env, &redeemer, market_ids);
+        Self::exit_reentrancy_guard(&env);
+        result
     }
 
     // ── LP ───────────────────────────────────────────────────────────────────
@@ -458,36 +405,10 @@ impl PredictionMarket {
         amount: i128,
     ) -> Result<i128, Error> {
         provider.require_auth();
-        Self::require_not_paused(&env)?;
-        let mut market = Self::load_market(&env, market_id)?;
-        Self::require_status(&market, &MarketStatus::Open)?;
-
-        // Mint LP shares proportional to the provider's share of the pool value.
-        // • First provider (empty pool): shares == amount (1:1 bootstrap).
-        // • Subsequent providers: shares = amount * total_lp_shares / lp_pool,
-        //   so later depositors into a more-valuable pool receive fewer shares
-        //   for the same nominal deposit, correctly diluting their claim.
-        let lp_shares = if market.lp_pool == 0 || market.total_lp_shares == 0 {
-            amount
-        } else {
-            (amount * market.total_lp_shares) / market.lp_pool
-        };
-
-        market.lp_pool += amount;
-        market.total_lp_shares += lp_shares;
-        market.yes_pool += amount / 2;
-        market.no_pool += amount / 2;
-        Self::save_market(&env, market_id, &market);
-
-        let mut pos = Self::load_position(&env, market_id, &provider);
-        pos.lp_shares += lp_shares;
-        Self::save_position(&env, market_id, &provider, &pos);
-        Self::emit_liquidity(
-            &env,
-            symbol_short!("added"),
-            (market_id, provider, amount, lp_shares),
-        );
-        Ok(lp_shares)
+        Self::enter_reentrancy_guard(&env)?;
+        let result = Self::add_liquidity_inner(&env, &provider, market_id, amount);
+        Self::exit_reentrancy_guard(&env);
+        result
     }
 
     pub fn remove_liquidity(
@@ -497,34 +418,10 @@ impl PredictionMarket {
         lp_shares: i128,
     ) -> Result<i128, Error> {
         provider.require_auth();
-        Self::require_not_paused(&env)?;
-        let mut market = Self::load_market(&env, market_id)?;
-        let mut pos = Self::load_position(&env, market_id, &provider);
-        if pos.lp_shares < lp_shares {
-            return Err(Error::InsufficientFunds);
-        }
-
-        // Payout = redeemed_shares * current_pool_value / total_shares_outstanding.
-        // This means an LP that deposited when the pool was large and trading has
-        // since shifted yes/no prices will receive a payout reflecting the pool's
-        // current total value — not just their original deposit.
-        let payout = if market.total_lp_shares > 0 {
-            (lp_shares * market.lp_pool) / market.total_lp_shares
-        } else {
-            lp_shares
-        };
-
-        market.lp_pool -= payout;
-        market.total_lp_shares -= lp_shares;
-        pos.lp_shares -= lp_shares;
-        Self::save_market(&env, market_id, &market);
-        Self::save_position(&env, market_id, &provider, &pos);
-        Self::emit_liquidity(
-            &env,
-            symbol_short!("removed"),
-            (market_id, provider, lp_shares, payout),
-        );
-        Ok(payout)
+        Self::enter_reentrancy_guard(&env)?;
+        let result = Self::remove_liquidity_inner(&env, &provider, market_id, lp_shares);
+        Self::exit_reentrancy_guard(&env);
+        result
     }
 
     pub fn claim_lp_fees(
@@ -617,6 +514,177 @@ impl PredictionMarket {
     // full topic/payload table.
 
     /// Publish an event under the `("market", action)` topic.
+    // ── Guarded internals (Checks-Effects-Interactions) ──────────────────────
+
+    fn redeem_inner(env: &Env, redeemer: &Address, market_id: u32) -> Result<i128, Error> {
+        Self::require_not_paused(&env)?;
+        let market = Self::load_market(env, market_id)?;
+        if market.status == MarketStatus::Cancelled {
+            return Self::refund_cancelled(env, redeemer, market_id, &market);
+        }
+        if market.status != MarketStatus::Resolved && market.status != MarketStatus::EmergencyResolved {
+            return Err(Error::MarketNotResolved);
+        }
+        let mut pos = Self::load_position(env, market_id, redeemer);
+        let winning_shares = match market.outcome {
+            Some(true) => pos.yes_shares,
+            Some(false) => pos.no_shares,
+            None => return Err(Error::InvalidOutcome),
+        };
+        if winning_shares == 0 {
+            return Err(Error::NothingToRedeem);
+        }
+        let total_pool = market.yes_pool + market.no_pool;
+        let total_winning = if market.outcome == Some(true) {
+            market.yes_shares
+        } else {
+            market.no_shares
+        };
+        let payout = if total_winning > 0 {
+            (winning_shares * total_pool) / total_winning
+        } else {
+            0
+        };
+        // Effects: clear the position and commit it to storage before any
+        // interaction (event emission / future token transfer) so that a
+        // re-entrant call observes zero winning shares (CEI pattern).
+        if market.outcome == Some(true) {
+            pos.yes_shares = 0;
+        } else {
+            pos.no_shares = 0;
+        }
+        Self::save_position(env, market_id, redeemer, &pos);
+        // Interactions
+        Self::emit(env, symbol_short!("redeemed"), (market_id, redeemer.clone(), payout));
+        Ok(payout)
+    }
+
+    fn batch_redeem_inner(env: &Env, redeemer: &Address, market_ids: Vec<u32>) -> Result<BatchRedeemResult, Error> {
+        let mut successes: Vec<RedeemOutcome> = Vec::new(env);
+        let mut failures: Vec<RedeemFailure> = Vec::new(env);
+        let mut total_payout: i128 = 0;
+
+        for id in market_ids.iter() {
+            match Self::redeem_inner(env, redeemer, id) {
+                Ok(payout) => {
+                    total_payout += payout;
+                    successes.push_back(RedeemOutcome {
+                        market_id: id,
+                        payout,
+                    });
+                }
+                Err(error) => {
+                    failures.push_back(RedeemFailure {
+                        market_id: id,
+                        error,
+                    });
+                }
+            }
+        }
+
+        Ok(BatchRedeemResult {
+            successes,
+            failures,
+            total_payout,
+        })
+    }
+
+    fn add_liquidity_inner(
+        env: &Env,
+        provider: &Address,
+        market_id: u32,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env)?;
+        let mut market = Self::load_market(env, market_id)?;
+        Self::require_status(&market, &MarketStatus::Open)?;
+
+        // Mint LP shares proportional to the provider's share of the pool value.
+        // • First provider (empty pool): shares == amount (1:1 bootstrap).
+        // • Subsequent providers: shares = amount * total_lp_shares / lp_pool,
+        //   so later depositors into a more-valuable pool receive fewer shares
+        //   for the same nominal deposit, correctly diluting their claim.
+        let lp_shares = if market.lp_pool == 0 || market.total_lp_shares == 0 {
+            amount
+        } else {
+            (amount * market.total_lp_shares) / market.lp_pool
+        };
+
+        market.lp_pool += amount;
+        market.total_lp_shares += lp_shares;
+        market.yes_pool += amount / 2;
+        market.no_pool += amount / 2;
+        Self::save_market(env, market_id, &market);
+
+        let mut pos = Self::load_position(env, market_id, provider);
+        pos.lp_shares += lp_shares;
+        Self::save_position(env, market_id, provider, &pos);
+        Self::emit_liquidity(
+            env,
+            symbol_short!("added"),
+            (market_id, provider.clone(), amount, lp_shares),
+        );
+        Ok(lp_shares)
+    }
+
+    fn remove_liquidity_inner(
+        env: &Env,
+        provider: &Address,
+        market_id: u32,
+        lp_shares: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env)?;
+        let mut market = Self::load_market(env, market_id)?;
+        let mut pos = Self::load_position(env, market_id, provider);
+        if pos.lp_shares < lp_shares {
+            return Err(Error::InsufficientFunds);
+        }
+
+        // Payout = redeemed_shares * current_pool_value / total_shares_outstanding.
+        // This means an LP that deposited when the pool was large and trading has
+        // since shifted yes/no prices will receive a payout reflecting the pool's
+        // current total value — not just their original deposit.
+        let payout = if market.total_lp_shares > 0 {
+            (lp_shares * market.lp_pool) / market.total_lp_shares
+        } else {
+            lp_shares
+        };
+
+        // Mirror `add_liquidity`, which credited half of each deposit to both
+        // yes_pool and no_pool: withdraw the same split of the payout so that
+        // `redeem` never pays out phantom liquidity. Clamped so the pools
+        // cannot underflow below zero.
+        let deduct_yes = (payout / 2).min(market.yes_pool).max(0);
+        let deduct_no = (payout / 2).min(market.no_pool).max(0);
+        market.yes_pool -= deduct_yes;
+        market.no_pool -= deduct_no;
+        market.lp_pool -= payout;
+        market.total_lp_shares -= lp_shares;
+        pos.lp_shares -= lp_shares;
+        Self::save_market(env, market_id, &market);
+        Self::save_position(env, market_id, provider, &pos);
+        Self::emit_liquidity(
+            env,
+            symbol_short!("removed"),
+            (market_id, provider.clone(), lp_shares, payout),
+        );
+        Ok(payout)
+    }
+
+    // ── Reentrancy guard ─────────────────────────────────────────────────────
+
+    fn enter_reentrancy_guard(env: &Env) -> Result<(), Error> {
+        if env.storage().instance().get::<_, bool>(&REENTRY).unwrap_or(false) {
+            return Err(Error::ReentrancyError);
+        }
+        env.storage().instance().set(&REENTRY, &true);
+        Ok(())
+    }
+
+    fn exit_reentrancy_guard(env: &Env) {
+        env.storage().instance().remove(&REENTRY);
+    }
+
     fn emit(env: &Env, action: Symbol, data: impl IntoVal<Env, Val>) {
         env.events().publish((symbol_short!("market"), action), data);
     }

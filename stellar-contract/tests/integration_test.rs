@@ -486,3 +486,121 @@ fn test_finalize_emits_resolved_event() {
     );
     assert_eq!(data, (mid, Some(true)).into_val(&env));
 }
+
+// ── #1255: remove_liquidity must unwind yes_pool / no_pool ───────────────────
+
+#[test]
+fn test_remove_liquidity_restores_yes_no_pools() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let lp = Address::generate(&env);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    let before = client.get_market(&mid);
+
+    let shares = client.add_liquidity(&lp, &mid, &500_000);
+    client.remove_liquidity(&lp, &mid, &shares);
+    let after = client.get_market(&mid);
+
+    assert_eq!(after.yes_pool, before.yes_pool);
+    assert_eq!(after.no_pool, before.no_pool);
+    assert_eq!(after.lp_pool, 0);
+    assert_eq!(after.total_lp_shares, 0);
+}
+
+#[test]
+fn test_lp_withdrawal_does_not_inflate_redeem_payout() {
+    // Market A: no LP activity. Market B: identical, plus an LP that deposits
+    // and fully withdraws. Winning payouts must be identical — before the fix
+    // B paid out the withdrawn LP liquidity a second time.
+    let (env, client, admin, _treasury, oracle) = setup();
+    let lp = Address::generate(&env);
+    let winner_a = Address::generate(&env);
+    let winner_b = Address::generate(&env);
+
+    let mid_a = client.create_market(&admin, &question(&env), &oracle);
+    let mid_b = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid_a, &1_000_000);
+    client.seed_market(&admin, &mid_b, &1_000_000);
+
+    let shares = client.add_liquidity(&lp, &mid_b, &2_000_000);
+    client.remove_liquidity(&lp, &mid_b, &shares);
+
+    client.buy_yes(&winner_a, &mid_a, &100_000, &1);
+    client.buy_yes(&winner_b, &mid_b, &100_000, &1);
+
+    for mid in [mid_a, mid_b] {
+        client.close_market(&admin, &mid);
+        client.oracle_report(&oracle, &mid, &true);
+        client.finalize(&mid);
+    }
+
+    let payout_a = client.redeem(&winner_a, &mid_a);
+    let payout_b = client.redeem(&winner_b, &mid_b);
+    assert_eq!(payout_a, payout_b);
+}
+
+// ── #1256: reentrancy guard / CEI ────────────────────────────────────────────
+
+#[test]
+fn test_reentrant_call_is_rejected_while_guard_held() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+
+    // Simulate an external callback re-entering mid-invocation by holding the
+    // transient lock in instance storage, exactly as an in-flight guarded call would.
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(&symbol_short!("REENTRY"), &true);
+    });
+
+    assert_eq!(
+        client.try_add_liquidity(&user, &mid, &1_000).unwrap_err().unwrap(),
+        Error::ReentrancyError
+    );
+    assert_eq!(
+        client.try_remove_liquidity(&user, &mid, &1).unwrap_err().unwrap(),
+        Error::ReentrancyError
+    );
+    assert_eq!(
+        client.try_redeem(&user, &mid).unwrap_err().unwrap(),
+        Error::ReentrancyError
+    );
+    assert_eq!(
+        client.try_batch_redeem(&user, &vec![&env, mid]).unwrap_err().unwrap(),
+        Error::ReentrancyError
+    );
+
+    // Once the lock is released the same calls proceed normally.
+    env.as_contract(&client.address, || {
+        env.storage().instance().remove(&symbol_short!("REENTRY"));
+    });
+    assert!(client.add_liquidity(&user, &mid, &1_000) > 0);
+}
+
+#[test]
+fn test_guard_released_after_error_and_batch_redeem_state_committed_first() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.buy_yes(&user, &mid, &100_000, &1);
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+    client.finalize(&mid);
+
+    // An erroring guarded call must not leave the lock held.
+    assert_eq!(
+        client.try_remove_liquidity(&user, &mid, &1).unwrap_err().unwrap(),
+        Error::InsufficientFunds
+    );
+
+    // batch_redeem runs under a single guard; redeeming the same market twice
+    // in one batch must pay once — the position is cleared before the second pass.
+    let result = client.batch_redeem(&user, &vec![&env, mid, mid]);
+    assert_eq!(result.successes.len(), 1);
+    assert_eq!(result.failures.len(), 1);
+    assert_eq!(result.failures.get(0).unwrap().error, Error::NothingToRedeem);
+    assert_eq!(client.get_position(&mid, &user).yes_shares, 0);
+}
