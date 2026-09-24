@@ -28,6 +28,7 @@ This is the documentation map for the FuTuRe platform — every markdown doc in 
 | [Security Best Practices](guides/security.md)                  | API key storage, CSRF protection, webhook signature verification, CSP, and known attack vectors                                          |
 | [Streaming Payment Security](../backend/STREAMING_SECURITY.md) | Per-stream secret encryption model and trade-offs for recurring payments                                                                 |
 | [Troubleshooting](guides/troubleshooting.md)                    | Local development environment problems — see also Getting Started above                                                                 |
+| [Internal Tooling Limitations](guides/internal-tooling.md)      | Current real-world scope and known limitations of the event-sourcing, load-testing, and chaos-engineering subsystems                   |
 
 ## Operations
 

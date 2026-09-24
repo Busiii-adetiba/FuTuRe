@@ -6,6 +6,7 @@ import prisma from '../db/client.js';
 import { eventMonitor } from '../eventSourcing/index.js';
 import { getHorizonServer, withHorizonRetry } from './stellar.js';
 import { extractStellarErrorCode, getStellarErrorInfo } from '../utils/stellarErrors.js';
+import { invalidateBalanceCache } from '../cache/balanceCache.js';
 
 function isTestnet() {
   return getConfig().stellar.network === 'testnet';
@@ -196,6 +197,26 @@ export async function sendPathPayment({
   }
 
   logger.info('pathPayment.send.success', { hash: result.hash, source: sourcePublicKey, destination });
+
+  await Promise.all([
+    invalidateBalanceCache(sourcePublicKey),
+    invalidateBalanceCache(destination),
+  ]);
+
+  try {
+    const { broadcastToAccount } = await import('./websocket.js');
+    broadcastToAccount(destination, {
+      type: 'balance_update',
+      action: 'path_payment_received',
+      source: sourcePublicKey,
+      destination,
+      amount: destMin,
+      assetCode: destAsset.code,
+      hash: result.hash,
+    });
+  } catch (wsErr) {
+    logger.warn('pathPayment.send.wsNotification.failed', { destination, error: wsErr.message });
+  }
 
   await eventMonitor.publishEvent(sourcePublicKey, {
     type: 'PathPaymentSent',
