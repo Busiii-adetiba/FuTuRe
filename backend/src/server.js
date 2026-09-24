@@ -62,6 +62,7 @@ import {
 import { securityMiddleware } from './middleware/securityHeaders.js';
 import { sanitizeInputs } from './middleware/sanitize.js';
 import { startScheduler, stopScheduler } from './scheduler.js';
+import { closeAMMState } from './services/amm.js';
 import { csrfTokenMiddleware, validateCSRFMiddleware, csrfTokenEndpoint } from './middleware/csrf.js';
 import { validateEncryptionKey } from './db/encryption.js';
 
@@ -293,6 +294,7 @@ async function shutdown(signal) {
   try {
     // 3. Stop background workers
     stopScheduler();
+    await closeAMMState();
     // 4. Close DB connection
     await disconnectDB();
     logger.info('server.shutdown.complete');
