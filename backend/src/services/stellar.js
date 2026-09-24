@@ -74,7 +74,7 @@ async function incrementFeeBumpStats(sourcePublicKey, feeStroops) {
  */
 export function wrapWithFeeBump(innerTx, feeAccountSecret) {
   const feeKeypair = StellarSDK.Keypair.fromSecret(feeAccountSecret);
-  const networkPassphrase = isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC;
+  const networkPassphrase = getNetworkPassphrase();
 
   const multiplier = parseInt(process.env.FEE_BUMP_MULTIPLIER ?? '10', 10);
   const feeBumpTx = StellarSDK.TransactionBuilder.buildFeeBumpTransaction(
@@ -89,6 +89,8 @@ export function wrapWithFeeBump(innerTx, feeAccountSecret) {
 
 let horizonServerUrl;
 let horizonServer;
+const STELLAR_MEMO_ID_MAX = 18446744073709551615n;
+const DEFAULT_FUTURENET_PASSPHRASE = 'Test SDF Future Network ; October 2022';
 
 /**
  * Return a cached Stellar Horizon server instance, re-creating it if the URL has changed.
@@ -187,6 +189,88 @@ export function isTestnet() {
 }
 
 /**
+ * Return network passphrase for the configured Stellar network.
+ * Supports testnet, mainnet, and futurenet.
+ * @returns {string}
+ */
+export function getNetworkPassphrase() {
+  const network = getConfig().stellar.network;
+  if (network === 'testnet') return StellarSDK.Networks.TESTNET;
+  if (network === 'mainnet') return StellarSDK.Networks.PUBLIC;
+  if (network === 'futurenet') return StellarSDK.Networks.FUTURENET ?? DEFAULT_FUTURENET_PASSPHRASE;
+  throw new Error(`Unsupported STELLAR_NETWORK value: ${network}`);
+}
+
+/**
+ * Error used when request payload data is semantically invalid.
+ */
+class ValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ValidationError';
+    this.status = 400;
+    this.statusCode = 400;
+  }
+}
+
+/**
+ * Validate memo value against Stellar memo type constraints.
+ * @param {string|number|null} memo
+ * @param {'text'|'id'|'hash'|'return'} memoType
+ * @returns {void}
+ * @throws {ValidationError}
+ */
+export function validateMemo(memo, memoType = 'text') {
+  if (memo === null || memo === undefined || memo === '') return;
+
+  const memoString = String(memo);
+  switch (memoType) {
+    case 'id': {
+      if (!/^\d+$/.test(memoString)) {
+        throw new ValidationError('MEMO_ID must be an unsigned 64-bit integer');
+      }
+      const value = BigInt(memoString);
+      if (value < 0n || value > STELLAR_MEMO_ID_MAX) {
+        throw new ValidationError('MEMO_ID must be between 0 and 18446744073709551615');
+      }
+      return;
+    }
+    case 'hash':
+    case 'return':
+      if (!/^[0-9a-fA-F]{64}$/.test(memoString)) {
+        throw new ValidationError(`MEMO_${memoType.toUpperCase()} must be a 32-byte hex string`);
+      }
+      return;
+    case 'text':
+    default: {
+      const memoBytes = Buffer.byteLength(memoString, 'utf8');
+      if (memoBytes > 28) {
+        throw new ValidationError('MEMO_TEXT exceeds 28 bytes limit');
+      }
+    }
+  }
+}
+
+/**
+ * Validate Horizon network passphrase matches configured network.
+ * @returns {Promise<{expectedPassphrase: string, actualPassphrase: string}>}
+ */
+export async function verifyHorizonNetworkPassphrase() {
+  const expectedPassphrase = getNetworkPassphrase();
+  const root = await withHorizonRetry(() => getHorizonServer().root());
+  const actualPassphrase = root?.network_passphrase;
+  if (actualPassphrase !== expectedPassphrase) {
+    const err = new Error(
+      `Horizon passphrase mismatch: expected "${expectedPassphrase}" but received "${actualPassphrase}"`,
+    );
+    err.status = 500;
+    err.statusCode = 500;
+    throw err;
+  }
+  return { expectedPassphrase, actualPassphrase };
+}
+
+/**
  * Fund a testnet account via Friendbot (testnet only).
  * @param {string} publicKey - Stellar public key of the account to fund
  * @returns {Promise<{funded: boolean, publicKey: string}>}
@@ -217,6 +301,7 @@ export async function createAccount(correlationId = null) {
       publicKey,
     });
 
+    let stellarAccountStatus = 'ACTIVE';
     if (isTestnet()) {
       const friendbotRes = await fetch(`https://friendbot.stellar.org?addr=${publicKey}`);
       if (!friendbotRes.ok) {
@@ -230,6 +315,41 @@ export async function createAccount(correlationId = null) {
         data: { publicKey, correlationId },
         version: 1,
       });
+    } else {
+      const sponsorSecret = process.env.PLATFORM_FUNDING_SECRET || process.env.PLATFORM_FEE_ACCOUNT_SECRET;
+      if (sponsorSecret) {
+        const sponsorKeypair = StellarSDK.Keypair.fromSecret(sponsorSecret);
+        const sponsorAccount = await withHorizonRetry(() =>
+          getHorizonServer().loadAccount(sponsorKeypair.publicKey()),
+        );
+        const startingBalance = process.env.STELLAR_MIN_ACCOUNT_RESERVE_XLM || '1';
+        const tx = new StellarSDK.TransactionBuilder(sponsorAccount, {
+          fee: StellarSDK.BASE_FEE,
+          networkPassphrase: getNetworkPassphrase(),
+        })
+          .addOperation(
+            StellarSDK.Operation.createAccount({
+              destination: publicKey,
+              startingBalance: String(startingBalance),
+            }),
+          )
+          .setTimeout(30)
+          .build();
+        tx.sign(sponsorKeypair);
+        await withHorizonRetry(() => getHorizonServer().submitTransaction(tx));
+        await eventMonitor.publishEvent(publicKey, {
+          type: 'AccountFunded',
+          data: { publicKey, correlationId, sponsor: sponsorKeypair.publicKey() },
+          version: 1,
+        });
+      } else {
+        stellarAccountStatus = 'PENDING_ACTIVATION';
+        logger.warn('stellar.createAccount.pendingActivation', {
+          publicKey,
+          correlationId,
+          network: getConfig().stellar.network,
+        });
+      }
     }
 
     await eventMonitor.publishEvent(publicKey, {
@@ -241,14 +361,15 @@ export async function createAccount(correlationId = null) {
     await prisma.user
       .upsert({
         where: { publicKey },
-        update: {},
-        create: { publicKey },
+        update: { stellarAccountStatus },
+        create: { publicKey, stellarAccountStatus },
       })
       .catch((err) => logger.warn('db.user.upsert.failed', { error: err.message, correlationId }));
 
     return {
       publicKey,
       secretKey: pair.secret(),
+      status: stellarAccountStatus,
     };
   });
 }
@@ -307,6 +428,8 @@ export async function sendPayment(
   const txCorrelationId = correlationId ?? randomUUID();
 
   const sourceKeypair = StellarSDK.Keypair.fromSecret(sourceSecret);
+  validateMemo(memo, memoType);
+
   const sourcePublicKey = sourceKeypair.publicKey();
   logger.info('stellar.sendPayment.start', {
     source: sourcePublicKey,
@@ -340,7 +463,7 @@ export async function sendPayment(
 
   const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
     fee: StellarSDK.BASE_FEE,
-    networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+    networkPassphrase: getNetworkPassphrase(),
   }).addOperation(
     StellarSDK.Operation.payment({
       destination,
@@ -528,7 +651,7 @@ export async function createTrustline(sourceSecret, assetCode, assetIssuer, limi
 
   const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
     fee: StellarSDK.BASE_FEE,
-    networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+    networkPassphrase: getNetworkPassphrase(),
   })
     .addOperation(StellarSDK.Operation.changeTrust(changeTrustOpts))
     .setTimeout(30)
@@ -601,7 +724,7 @@ export async function removeTrustline(sourceSecret, assetCode) {
 
   const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
     fee: StellarSDK.BASE_FEE,
-    networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+    networkPassphrase: getNetworkPassphrase(),
   })
     .addOperation(StellarSDK.Operation.changeTrust({ asset, limit: '0' }))
     .setTimeout(30)
@@ -903,7 +1026,7 @@ export async function getNetworkStatus() {
     try {
       const root = await withHorizonRetry(() => getHorizonServer().root());
       const status = {
-        network: isTestnet() ? 'testnet' : 'mainnet',
+        network: getConfig().stellar.network,
         horizonUrl,
         online: true,
         horizonVersion: root.horizon_version,
@@ -915,7 +1038,7 @@ export async function getNetworkStatus() {
     } catch (err) {
       logger.warn('stellar.networkStatus.offline', { error: err.message });
       return {
-        network: isTestnet() ? 'testnet' : 'mainnet',
+        network: getConfig().stellar.network,
         horizonUrl,
         online: false,
       };
@@ -1064,7 +1187,7 @@ export async function updateTrustlineLimit(sourceSecret, assetCode, assetIssuer,
   const asset = new StellarSDK.Asset(assetCode, issuer);
   const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
     fee: StellarSDK.BASE_FEE,
-    networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+    networkPassphrase: getNetworkPassphrase(),
   })
     .addOperation(StellarSDK.Operation.changeTrust({ asset, limit: newLimit.toString() }))
     .setTimeout(30)
@@ -1131,7 +1254,7 @@ export async function mergeAccount(sourceSecret, destination) {
 
   const transaction = new StellarSDK.TransactionBuilder(sourceAccount, {
     fee: StellarSDK.BASE_FEE,
-    networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+    networkPassphrase: getNetworkPassphrase(),
   })
     .addOperation(StellarSDK.Operation.accountMerge({ destination }))
     .setTimeout(30)
@@ -1229,6 +1352,8 @@ export async function buildUnsignedXdr(
   memo = null,
   memoType = 'text',
 ) {
+  validateMemo(memo, memoType);
+
   const sourceKeypair = StellarSDK.Keypair.fromSecret(sourceSecret);
   const sourcePublicKey = sourceKeypair.publicKey();
 
@@ -1247,7 +1372,7 @@ export async function buildUnsignedXdr(
 
   const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
     fee: StellarSDK.BASE_FEE,
-    networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+    networkPassphrase: getNetworkPassphrase(),
   }).addOperation(
     StellarSDK.Operation.payment({
       destination,

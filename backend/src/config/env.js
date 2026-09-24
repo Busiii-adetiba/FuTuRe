@@ -207,9 +207,9 @@ function parseStellarNetwork(raw, { appEnv, envVarName }) {
   const normalized = value.toLowerCase();
 
   if (normalized === 'public') return 'mainnet';
-  if (normalized === 'mainnet' || normalized === 'testnet') return normalized;
+  if (normalized === 'mainnet' || normalized === 'testnet' || normalized === 'futurenet') return normalized;
 
-  throw new Error(`${envVarName} must be "testnet" or "mainnet"`);
+  throw new Error(`${envVarName} must be "testnet", "futurenet", or "mainnet"`);
 }
 
 function assertValidPort(port, { envVarName }) {
@@ -287,7 +287,11 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
   });
 
   const defaultHorizonUrl =
-    stellarNetwork === 'testnet' ? 'https://horizon-testnet.stellar.org' : 'https://horizon.stellar.org';
+    stellarNetwork === 'testnet'
+      ? 'https://horizon-testnet.stellar.org'
+      : stellarNetwork === 'futurenet'
+        ? 'https://horizon-futurenet.stellar.org'
+        : 'https://horizon.stellar.org';
 
   const horizonUrl = maybeDecryptEnvValue(env.HORIZON_URL ?? defaultHorizonUrl, encryptionKey, {
     envVarName: 'HORIZON_URL',
@@ -301,7 +305,11 @@ export function createConfigFromEnv(env, { appEnv, nodeEnv, loadedEnvFiles } = {
       : undefined;
 
   const defaultSorobanRpcUrl =
-    stellarNetwork === 'testnet' ? 'https://soroban-testnet.stellar.org' : 'https://mainnet.sorobanrpc.com';
+    stellarNetwork === 'testnet'
+      ? 'https://soroban-testnet.stellar.org'
+      : stellarNetwork === 'futurenet'
+        ? 'https://rpc-futurenet.stellar.org'
+        : 'https://mainnet.sorobanrpc.com';
 
   const sorobanRpcUrl = maybeDecryptEnvValue(env.SOROBAN_RPC_URL ?? defaultSorobanRpcUrl, encryptionKey, {
     envVarName: 'SOROBAN_RPC_URL',

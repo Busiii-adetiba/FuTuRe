@@ -13,7 +13,7 @@ import logger from './config/logger.js';
 import { requestLogger } from './middleware/requestLogger.js';
 import { connectDB, checkDBHealth, disconnectDB } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
-import { startHorizonLatencyMonitor } from './services/stellar.js';
+import { startHorizonLatencyMonitor, verifyHorizonNetworkPassphrase } from './services/stellar.js';
 import stellarRoutes from './routes/stellar/index.js';
 import multiSigRoutes from './routes/multiSig.js';
 import authRoutes from './routes/auth.js';
@@ -156,6 +156,7 @@ await connectDB();
 await eventMonitor.initialize();
 await auditLogger.initialize();
 await initIPWhitelistCache();
+await verifyHorizonNetworkPassphrase();
 
 // Swagger Documentation
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));

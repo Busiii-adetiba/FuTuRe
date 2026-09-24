@@ -260,6 +260,30 @@ describe('Stellar Service Unit Tests', () => {
       
       expect(prisma.default.user.upsert).toHaveBeenCalled();
     });
+
+    it('should mark non-testnet accounts as pending activation when no sponsor is configured', async () => {
+      const { getConfig } = await import('../src/config/env.js');
+      getConfig.mockReturnValue({
+        stellar: {
+          network: 'mainnet',
+          horizonUrl: 'https://horizon.stellar.org',
+        },
+      });
+      global.fetch = vi.fn();
+      delete process.env.PLATFORM_FUNDING_SECRET;
+      delete process.env.PLATFORM_FEE_ACCOUNT_SECRET;
+
+      const result = await stellarService.createAccount();
+      expect(result.status).toBe('PENDING_ACTIVATION');
+      expect(global.fetch).not.toHaveBeenCalled();
+      getConfig.mockReturnValue({
+        stellar: {
+          network: 'testnet',
+          horizonUrl: 'https://horizon-testnet.stellar.org',
+          assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+        },
+      });
+    });
   });
 
   describe('getBalance', () => {
@@ -413,6 +437,27 @@ describe('Stellar Service Unit Tests', () => {
       // Should not throw, just log warning
       const result = await stellarService.sendPayment(sourceSecret, destination, amount);
       expect(result).toBeDefined();
+    });
+
+    it('should reject MEMO_TEXT that exceeds 28 UTF-8 bytes', async () => {
+      const sourceSecret = 'SBZVMB74Z76QZ3ZVU4Z7YVCC5L7GXWCF7IXLMQVVXTNQRYUOP7HGHJH';
+      const destination = 'GBXIJJGUJJBBX7IXLMQVVXTNQRYUOP7HGHJHGBRPYHIL2CI3WHZDTOOQFC6';
+      const amount = '10';
+      const oversizedUtf8Memo = '🚀'.repeat(8); // 32 bytes in UTF-8
+
+      await expect(
+        stellarService.sendPayment(sourceSecret, destination, amount, 'XLM', oversizedUtf8Memo, 'text')
+      ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('should reject invalid MEMO_HASH format with 400', async () => {
+      const sourceSecret = 'SBZVMB74Z76QZ3ZVU4Z7YVCC5L7GXWCF7IXLMQVVXTNQRYUOP7HGHJH';
+      const destination = 'GBXIJJGUJJBBX7IXLMQVVXTNQRYUOP7HGHJHGBRPYHIL2CI3WHZDTOOQFC6';
+      const amount = '10';
+
+      await expect(
+        stellarService.sendPayment(sourceSecret, destination, amount, 'XLM', 'not-hex', 'hash')
+      ).rejects.toMatchObject({ statusCode: 400 });
     });
   });
 
@@ -621,6 +666,39 @@ describe('Stellar Service Unit Tests', () => {
       const result = await stellarService.getNetworkStatus();
       
       expect(result).toHaveProperty('network', 'mainnet');
+    });
+
+    it('should verify Horizon passphrase matches configured network', async () => {
+      await expect(stellarService.verifyHorizonNetworkPassphrase()).resolves.toEqual({
+        expectedPassphrase: 'Test SDF Network ; September 2015',
+        actualPassphrase: 'Test SDF Network ; September 2015',
+      });
+    });
+
+    it('should throw when Horizon passphrase does not match configured network', async () => {
+      const { getConfig } = await import('../src/config/env.js');
+      getConfig.mockReturnValue({
+        stellar: {
+          network: 'mainnet',
+          horizonUrl: 'https://horizon.stellar.org',
+        },
+      });
+      mockServer.root.mockResolvedValueOnce({
+        horizon_version: '20.0.0',
+        network_passphrase: 'Test SDF Network ; September 2015',
+        current_protocol_version: '19',
+      });
+
+      await expect(stellarService.verifyHorizonNetworkPassphrase()).rejects.toThrow(
+        /Horizon passphrase mismatch/i
+      );
+      getConfig.mockReturnValue({
+        stellar: {
+          network: 'testnet',
+          horizonUrl: 'https://horizon-testnet.stellar.org',
+          assetIssuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+        },
+      });
     });
   });
 
