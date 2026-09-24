@@ -11,7 +11,13 @@ import swaggerUi from 'swagger-ui-express';
 import swaggerSpec from './config/swagger.js';
 import logger from './config/logger.js';
 import { requestLogger } from './middleware/requestLogger.js';
-import { connectDB, checkDBHealth, disconnectDB } from './db/client.js';
+import {
+  connectDB,
+  checkDBHealth,
+  disconnectDB,
+  DatabaseConnectionError,
+  reconnectDBInBackground,
+} from './db/client.js';
 import { runMigrations } from './db/migrate.js';
 import { startHorizonLatencyMonitor } from './services/stellar.js';
 import stellarRoutes from './routes/stellar/index.js';
@@ -153,7 +159,16 @@ app.use(sanitizeInputs);
 
 // Initialize event sourcing
 await runMigrations();
-await connectDB();
+try {
+  await connectDB();
+} catch (err) {
+  if (!(err instanceof DatabaseConnectionError)) throw err;
+  // Don't crash-loop the container while the database recovers (RDS failover,
+  // cold boot). Serve in degraded mode — /health reports it — and keep
+  // reconnecting in the background.
+  logger.error('server.startup.db.unavailable', { error: err.message, attempts: err.attempts });
+  reconnectDBInBackground();
+}
 await eventMonitor.initialize();
 await auditLogger.initialize();
 await initIPWhitelistCache();
