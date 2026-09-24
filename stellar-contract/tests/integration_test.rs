@@ -575,6 +575,350 @@ fn test_finalize_emits_resolved_event() {
     assert_eq!(data, (mid, Some(true)).into_val(&env));
 }
 
+// ── 11. Zero-liquidity swaps (#1262) ─────────────────────────────────────────
+//
+// Trades against a market with no reserves, or with non-positive amounts, must
+// be rejected with a typed error and leave pool state untouched.
+
+#[test]
+fn test_zero_liquidity_swap_rejection() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let trader = Address::generate(&env);
+
+    // Fresh market: no seed, no LP deposits → both reserves are zero.
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let before = client.get_market(&mid);
+    assert_eq!(before.yes_pool, 0);
+    assert_eq!(before.no_pool, 0);
+
+    // Zero-amount trades against the empty pool are rejected.
+    let err = client.try_buy_yes(&trader, &mid, &0, &0).unwrap_err().unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+    let err = client.try_buy_no(&trader, &mid, &0, &0).unwrap_err().unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+
+    // Negative amounts must never be able to drive reserves below zero.
+    let err = client
+        .try_buy_yes(&trader, &mid, &-1_000, &i128::MIN)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+    let err = client
+        .try_buy_no(&trader, &mid, &-1_000, &i128::MIN)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+
+    // A slippage bound that the empty pool cannot satisfy fails cleanly.
+    let err = client
+        .try_buy_yes(&trader, &mid, &1_000, &1_001)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::SlippageExceeded);
+
+    // No rejected trade may have mutated market or position state.
+    let after = client.get_market(&mid);
+    assert_eq!(after.yes_pool, 0);
+    assert_eq!(after.no_pool, 0);
+    assert_eq!(after.yes_shares, 0);
+    assert_eq!(after.no_shares, 0);
+    let pos = client.get_position(&mid, &trader);
+    assert_eq!(pos.yes_shares, 0);
+    assert_eq!(pos.no_shares, 0);
+
+    // Depleted LP pool: after the only LP exits, trades still behave
+    // deterministically rather than dividing by zero.
+    let lp = Address::generate(&env);
+    let lp_mid = client.create_market(&admin, &question(&env), &oracle);
+    let shares = client.add_liquidity(&lp, &lp_mid, &1_000_000);
+    client.remove_liquidity(&lp, &lp_mid, &shares);
+    let drained = client.get_market(&lp_mid);
+    assert_eq!(drained.lp_pool, 0);
+    assert_eq!(drained.total_lp_shares, 0);
+    let err = client
+        .try_buy_yes(&trader, &lp_mid, &0, &0)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+    assert!(client.buy_yes(&trader, &lp_mid, &10_000, &1) > 0);
+}
+
+// ── 12. CPMM arithmetic overflow protection (#1262) ──────────────────────────
+//
+// Extreme i128 quantities must surface `Error::ArithmeticOverflow` instead of
+// panicking, and must not partially apply any state change.
+
+#[test]
+fn test_cpmm_arithmetic_overflow_protection() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let trader = Address::generate(&env);
+    let lp = Address::generate(&env);
+
+    // Trade overflow: own_pool + amount exceeds i128::MAX.
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    let err = client
+        .try_buy_yes(&trader, &mid, &i128::MAX, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+    let err = client
+        .try_buy_no(&trader, &mid, &i128::MAX, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+
+    // Share calculation overflow: amount * (yes_pool + no_pool) exceeds i128::MAX.
+    let err = client
+        .try_buy_yes(&trader, &mid, &(i128::MAX / 2), &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+
+    let market = client.get_market(&mid);
+    assert_eq!(market.yes_pool, 1_000_000);
+    assert_eq!(market.no_pool, 1_000_000);
+    assert_eq!(market.yes_shares, 0);
+    assert_eq!(market.no_shares, 0);
+    assert_eq!(client.get_position(&mid, &trader).yes_shares, 0);
+
+    // Seed overflow: reserves already at i128::MAX cannot be topped up.
+    let seed_mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &seed_mid, &i128::MAX);
+    let err = client
+        .try_seed_market(&admin, &seed_mid, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+    // With reserves at i128::MAX, even a 1-unit trade overflows the CPMM formula.
+    let err = client
+        .try_buy_yes(&trader, &seed_mid, &1, &0)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+
+    // LP overflow: a bootstrap deposit of i128::MAX saturates lp_pool, so any
+    // further deposit must be rejected rather than wrapping.
+    let lp_mid = client.create_market(&admin, &question(&env), &oracle);
+    let shares = client.add_liquidity(&lp, &lp_mid, &i128::MAX);
+    assert_eq!(shares, i128::MAX);
+    let err = client
+        .try_add_liquidity(&lp, &lp_mid, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+    let lp_market = client.get_market(&lp_mid);
+    assert_eq!(lp_market.lp_pool, i128::MAX);
+    assert_eq!(lp_market.total_lp_shares, i128::MAX);
+    assert_eq!(client.get_position(&lp_mid, &lp).lp_shares, i128::MAX);
+}
+
+// ── 13. Sequential multi-LP fee distribution (#1262) ─────────────────────────
+//
+// Several LPs deposit, trades happen in between, and LPs withdraw in a
+// different order than they joined. Every LP share must be worth the same
+// amount at every step, fee claims must never exceed accrued fees, and the
+// pool must end fully drained with nothing stranded.
+
+#[test]
+fn test_sequential_lp_fee_distribution_equality() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let lp_a = Address::generate(&env);
+    let lp_b = Address::generate(&env);
+    let lp_c = Address::generate(&env);
+    let trader = Address::generate(&env);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+
+    // LP-A bootstraps: 1:1 shares.
+    let shares_a = client.add_liquidity(&lp_a, &mid, &1_000_000);
+    assert_eq!(shares_a, 1_000_000);
+
+    // A trade between deposits must not dilute or inflate later LP shares.
+    client.buy_yes(&trader, &mid, &100_000, &1);
+
+    let shares_b = client.add_liquidity(&lp_b, &mid, &500_000);
+    assert_eq!(shares_b, 500_000);
+
+    client.buy_no(&trader, &mid, &50_000, &1);
+
+    let shares_c = client.add_liquidity(&lp_c, &mid, &250_000);
+    assert_eq!(shares_c, 250_000);
+
+    let market = client.get_market(&mid);
+    assert_eq!(market.lp_pool, 1_750_000);
+    assert_eq!(market.total_lp_shares, shares_a + shares_b + shares_c);
+
+    // Fee claims are proportional to shares and in total can never exceed
+    // what has accrued in the pool.
+    let accrued = market.lp_fees;
+    let fee_a = client.claim_lp_fees(&lp_a, &mid);
+    let fee_b = client.claim_lp_fees(&lp_b, &mid);
+    let fee_c = client.claim_lp_fees(&lp_c, &mid);
+    assert!(fee_a >= 0 && fee_b >= 0 && fee_c >= 0);
+    assert!(fee_a + fee_b + fee_c <= accrued);
+    // Shares are 4:2:1, so claims must respect that ordering.
+    assert!(fee_a >= fee_b && fee_b >= fee_c);
+    assert!(client.get_market(&mid).lp_fees >= 0);
+
+    // Withdraw out of order: B fully, A half, C fully, then A's remainder.
+    // Every withdrawal must pay exactly shares * lp_pool / total_lp_shares.
+    let payout_b = client.remove_liquidity(&lp_b, &mid, &shares_b);
+    assert_eq!(payout_b, 500_000);
+
+    let half_a = shares_a / 2;
+    let payout_a1 = client.remove_liquidity(&lp_a, &mid, &half_a);
+    assert_eq!(payout_a1, 500_000);
+
+    let payout_c = client.remove_liquidity(&lp_c, &mid, &shares_c);
+    assert_eq!(payout_c, 250_000);
+
+    let payout_a2 = client.remove_liquidity(&lp_a, &mid, &(shares_a - half_a));
+    assert_eq!(payout_a2, 500_000);
+
+    // Total paid out equals total deposited; nothing is stranded.
+    assert_eq!(
+        payout_a1 + payout_a2 + payout_b + payout_c,
+        1_000_000 + 500_000 + 250_000
+    );
+    let drained = client.get_market(&mid);
+    assert_eq!(drained.lp_pool, 0);
+    assert_eq!(drained.total_lp_shares, 0);
+
+    // Exited LPs hold nothing and cannot claim further fees.
+    assert_eq!(client.get_position(&mid, &lp_a).lp_shares, 0);
+    let err = client.try_claim_lp_fees(&lp_c, &mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::NothingToRedeem);
+
+    // Over-withdrawal is rejected.
+    let err = client
+        .try_remove_liquidity(&lp_b, &mid, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InsufficientFunds);
+}
+
+// ── 14. Full dispute state machine (#1262) ───────────────────────────────────
+//
+// Closed → Disputed → (reject) Closed → Disputed → (uphold) EmergencyResolved
+// → Resolved, plus the illegal transitions along the way.
+
+#[test]
+fn test_full_dispute_lifecycle_uphold_and_reject() {
+    use prediction_market::MarketStatus;
+
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user_yes = Address::generate(&env);
+    let user_no = Address::generate(&env);
+    let disputer_1 = Address::generate(&env);
+    let disputer_2 = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.buy_yes(&user_yes, &mid, &100_000, &1);
+    client.buy_no(&user_no, &mid, &100_000, &1);
+
+    // Cannot dispute an open market.
+    let err = client
+        .try_dispute(&disputer_1, &mid, &50_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+
+    client.close_market(&admin, &mid);
+
+    // Cannot dispute before the oracle has reported.
+    let err = client
+        .try_dispute(&disputer_1, &mid, &50_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidOutcome);
+
+    // Admin cannot rule on a market that is not disputed.
+    assert!(client.try_admin_reject_dispute(&admin, &mid).is_err());
+    assert!(client.try_admin_uphold_dispute(&admin, &mid, &true).is_err());
+
+    // Oracle reports NO.
+    client.oracle_report(&oracle, &mid, &false);
+
+    // ── Round 1: dispute rejected, bond slashed ──────────────────────────────
+    client.dispute(&disputer_1, &mid, &50_000);
+    let m = client.get_market(&mid);
+    assert_eq!(m.status, MarketStatus::Disputed);
+    assert_eq!(m.disputer, Some(disputer_1.clone()));
+    assert_eq!(m.dispute_bond, 50_000);
+
+    // While disputed: no finalize, no redeem, no second concurrent dispute.
+    let err = client.try_finalize(&mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+    let err = client.try_redeem(&user_no, &mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::MarketNotResolved);
+    let err = client
+        .try_dispute(&disputer_2, &mid, &10_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+
+    // Only the admin may rule.
+    let err = client
+        .try_admin_reject_dispute(&stranger, &mid)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+    let err = client
+        .try_admin_uphold_dispute(&stranger, &mid, &true)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+
+    client.admin_reject_dispute(&admin, &mid);
+    assert_eq!(client.get_treasury_balance(), 50_000);
+    let m = client.get_market(&mid);
+    assert_eq!(m.status, MarketStatus::Closed);
+    assert_eq!(m.disputer, None);
+    assert_eq!(m.dispute_bond, 0);
+    assert_eq!(m.outcome, Some(false), "rejection must keep the oracle outcome");
+
+    // ── Round 2: re-dispute upheld, outcome overridden ───────────────────────
+    client.dispute(&disputer_2, &mid, &75_000);
+    let m = client.get_market(&mid);
+    assert_eq!(m.status, MarketStatus::Disputed);
+    assert_eq!(m.disputer, Some(disputer_2.clone()));
+    assert_eq!(m.dispute_bond, 75_000);
+
+    client.admin_uphold_dispute(&admin, &mid, &true);
+    let m = client.get_market(&mid);
+    assert_eq!(m.status, MarketStatus::EmergencyResolved);
+    assert_eq!(m.outcome, Some(true), "upheld dispute must override outcome");
+    // Upholding does not slash: treasury only holds the round-1 bond.
+    assert_eq!(client.get_treasury_balance(), 50_000);
+
+    // Cannot re-dispute or re-rule once emergency-resolved.
+    let err = client
+        .try_dispute(&disputer_1, &mid, &10_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+    assert!(client.try_admin_reject_dispute(&admin, &mid).is_err());
+
+    // ── Finalize and settle on the overridden outcome ────────────────────────
+    client.finalize(&mid);
+    assert_eq!(client.get_market(&mid).status, MarketStatus::Resolved);
+
+    let payout = client.redeem(&user_yes, &mid);
+    assert!(payout > 0);
+    let err = client.try_redeem(&user_no, &mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::NothingToRedeem);
+
+    // Resolved markets are terminal for the dispute machine.
+    let err = client
+        .try_dispute(&disputer_1, &mid, &10_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+    let err = client.try_finalize(&mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
 // ── 11. Emergency upgrade & market containment (#1259) ────────────────────────
 
 #[test]
