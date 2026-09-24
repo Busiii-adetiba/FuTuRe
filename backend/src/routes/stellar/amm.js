@@ -42,8 +42,12 @@ const positiveFloat = (field) =>
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-router.get('/pools', (req, res) => {
-  res.json({ pools: AMMService.getAllPools() });
+router.get('/pools', async (req, res) => {
+  try {
+    res.json({ pools: await AMMService.getAllPools() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 router.post(
@@ -55,18 +59,18 @@ router.post(
   positiveFloat('reserveB'),
   body('feeBps').optional().isInt({ min: 0 }).withMessage('feeBps must be a non-negative integer'),
   validate,
-  (req, res) => {
+  async (req, res) => {
     try {
-      res.json(AMMService.registerPool(req.body));
+      res.json(await AMMService.registerPool(req.body));
     } catch (error) {
       res.status(400).json({ error: error.message });
     }
   },
 );
 
-router.get('/pools/:poolId', (req, res) => {
+router.get('/pools/:poolId', async (req, res) => {
   try {
-    res.json(AMMService.getPoolState(req.params.poolId));
+    res.json(await AMMService.getPoolState(req.params.poolId));
   } catch (error) {
     res.status(404).json({ error: error.message });
   }
@@ -80,9 +84,9 @@ router.post(
   positiveFloat('amountIn'),
   body('traderId').optional().isString().trim().notEmpty().withMessage('traderId must be a non-empty string'),
   validate,
-  (req, res) => {
+  async (req, res) => {
     try {
-      res.json(AMMService.executeSwap(req.body));
+      res.json(await AMMService.executeSwap(req.body));
     } catch (error) {
       res.status(400).json({ error: error.message });
     }
@@ -94,12 +98,16 @@ router.get(
   param('assetA').isString().trim().notEmpty().withMessage('assetA must be a non-empty string'),
   param('assetB').isString().trim().notEmpty().withMessage('assetB must be a non-empty string'),
   validate,
-  (req, res) => {
-    const opportunities = AMMService.detectArbitrageOpportunities([
-      req.params.assetA,
-      req.params.assetB,
-    ]);
-    res.json({ opportunities });
+  async (req, res) => {
+    try {
+      const opportunities = await AMMService.detectArbitrageOpportunities([
+        req.params.assetA,
+        req.params.assetB,
+      ]);
+      res.json({ opportunities });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
   },
 );
 
@@ -116,9 +124,9 @@ router.post(
     .isArray()
     .withMessage('marketPrices must be an array'),
   validate,
-  (req, res) => {
+  async (req, res) => {
     try {
-      res.json(AMMService.runAutomatedStrategy(req.body));
+      res.json(await AMMService.runAutomatedStrategy(req.body));
     } catch (error) {
       res.status(400).json({ error: error.message });
     }
@@ -135,9 +143,9 @@ router.post(
     .isFloat({ min: 0, max: 1 })
     .withMessage('targetWeightA must be a number between 0 and 1'),
   validate,
-  (req, res) => {
+  async (req, res) => {
     try {
-      res.json(AMMService.automateLiquidityProvision(req.body));
+      res.json(await AMMService.automateLiquidityProvision(req.body));
     } catch (error) {
       res.status(400).json({ error: error.message });
     }
@@ -149,25 +157,37 @@ router.post(
   poolIdBody,
   body('providerId').isString().trim().notEmpty().withMessage('providerId must be a non-empty string'),
   validate,
-  (req, res) => {
+  async (req, res) => {
     try {
-      res.json(AMMService.estimateYieldFarming(req.body));
+      res.json(await AMMService.estimateYieldFarming(req.body));
     } catch (error) {
       res.status(400).json({ error: error.message });
     }
   },
 );
 
-router.get('/analytics', (req, res) => {
-  res.json(AMMService.getAMMAnalytics());
+router.get('/analytics', async (req, res) => {
+  try {
+    res.json(await AMMService.getAMMAnalytics());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-router.get('/risk', (req, res) => {
-  res.json(AMMService.runRiskChecks());
+router.get('/risk', async (req, res) => {
+  try {
+    res.json(await AMMService.runRiskChecks());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-router.get('/optimize', (req, res) => {
-  res.json(AMMService.optimizeAMMPerformance());
+router.get('/optimize', async (req, res) => {
+  try {
+    res.json(await AMMService.optimizeAMMPerformance());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 export default router;

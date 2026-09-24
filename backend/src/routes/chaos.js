@@ -27,6 +27,7 @@ router.use(requireAdmin);
  * /api/chaos/inject/latency:
  *   post:
  *     summary: Inject latency into a target
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -60,6 +61,7 @@ router.post('/inject/latency', (req, res) => {
  * /api/chaos/inject/error:
  *   post:
  *     summary: Inject errors into a target
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -94,6 +96,7 @@ router.post('/inject/error', (req, res) => {
  * /api/chaos/inject/packet-loss:
  *   post:
  *     summary: Inject packet loss into a target
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -127,6 +130,7 @@ router.post('/inject/packet-loss', (req, res) => {
  * /api/chaos/failures/active:
  *   get:
  *     summary: Get all active failure injections
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     responses:
  *       200:
@@ -148,6 +152,7 @@ router.get('/failures/active', (req, res) => {
  * /api/chaos/failures/remove/{injectionId}:
  *   post:
  *     summary: Remove a failure injection
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     parameters:
  *       - in: path
@@ -174,6 +179,7 @@ router.post('/failures/remove/:injectionId', (req, res) => {
  * /api/chaos/network/partition:
  *   post:
  *     summary: Create a network partition
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -207,6 +213,7 @@ router.post('/network/partition', (req, res) => {
  * /api/chaos/network/partitions:
  *   get:
  *     summary: Get active network partitions
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     responses:
  *       200:
@@ -228,6 +235,7 @@ router.get('/network/partitions', (req, res) => {
  * /api/chaos/network/heal/{partitionId}:
  *   post:
  *     summary: Heal a network partition
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     parameters:
  *       - in: path
@@ -254,6 +262,7 @@ router.post('/network/heal/:partitionId', (req, res) => {
  * /api/chaos/service/fail:
  *   post:
  *     summary: Simulate a service failure
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -287,6 +296,7 @@ router.post('/service/fail', (req, res) => {
  * /api/chaos/service/failures:
  *   get:
  *     summary: Get all service failures
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     responses:
  *       200:
@@ -308,6 +318,7 @@ router.get('/service/failures', (req, res) => {
  * /api/chaos/service/recover/{serviceId}:
  *   post:
  *     summary: Recover a failed service
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     parameters:
  *       - in: path
@@ -334,6 +345,7 @@ router.post('/service/recover/:serviceId', (req, res) => {
  * /api/chaos/database/fail:
  *   post:
  *     summary: Simulate a database failure
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -367,6 +379,7 @@ router.post('/database/fail', (req, res) => {
  * /api/chaos/database/query-failure:
  *   post:
  *     summary: Inject query-level database failures
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -400,6 +413,7 @@ router.post('/database/query-failure', (req, res) => {
  * /api/chaos/recovery/record:
  *   post:
  *     summary: Record a recovery time metric
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -434,6 +448,7 @@ router.post('/recovery/record', (req, res) => {
  * /api/chaos/recovery/report/{serviceId}:
  *   get:
  *     summary: Get recovery time report for a service
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     parameters:
  *       - in: path
@@ -460,6 +475,7 @@ router.get('/recovery/report/:serviceId', (req, res) => {
  * /api/chaos/blast-radius/limit:
  *   post:
  *     summary: Set blast radius limits for chaos experiments
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -494,6 +510,7 @@ router.post('/blast-radius/limit', (req, res) => {
  * /api/chaos/blast-radius/check:
  *   post:
  *     summary: Check if a failure injection is within blast radius limits
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -527,6 +544,7 @@ router.post('/blast-radius/check', (req, res) => {
  * /api/chaos/experiments/create:
  *   post:
  *     summary: Create a chaos experiment
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -561,6 +579,7 @@ router.post('/experiments/create', async (req, res) => {
  * /api/chaos/experiments/{experimentId}/run:
  *   post:
  *     summary: Run a chaos experiment
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     parameters:
  *       - in: path
@@ -587,6 +606,7 @@ router.post('/experiments/:experimentId/run', async (req, res) => {
  * /api/chaos/experiments:
  *   get:
  *     summary: List all chaos experiments
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     responses:
  *       200:
@@ -608,6 +628,7 @@ router.get('/experiments', async (req, res) => {
  * /api/chaos/reports/generate:
  *   post:
  *     summary: Generate a chaos experiment report
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     requestBody:
  *       required: true
@@ -641,6 +662,7 @@ router.post('/reports/generate', async (req, res) => {
  * /api/chaos/reports/{experimentId}:
  *   get:
  *     summary: Get reports for a chaos experiment
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     parameters:
  *       - in: path
@@ -671,6 +693,7 @@ router.get('/reports/:experimentId', async (req, res) => {
  * /api/chaos/reports/summary:
  *   get:
  *     summary: Get a summary report across all chaos experiments
+ *     description: "Known limitation: chaos injections are currently bookkeeping-only and do not affect real request handling. See docs/guides/internal-tooling.md#chaos-engineering"
  *     tags: [Chaos]
  *     responses:
  *       200:
