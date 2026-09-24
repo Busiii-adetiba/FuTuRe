@@ -7,6 +7,7 @@ import { getIssuer } from '../config/assets.js';
 import logger from '../config/logger.js';
 import { getHorizonServer, withHorizonRetry } from './stellar.js';
 import { extractStellarErrorCode, getStellarErrorInfo } from '../utils/stellarErrors.js';
+import { invalidateBalanceCache } from '../cache/balanceCache.js';
 
 function isTestnet() {
   return getConfig().stellar.network === 'testnet';
@@ -229,6 +230,29 @@ export async function submitMultiSigTransaction(txId) {
     where: { txId },
     data: { status: result.successful ? 'submitted' : 'failed' },
   });
+
+  if (pending.destination) {
+    await Promise.all([
+      invalidateBalanceCache(pending.sourcePublicKey),
+      invalidateBalanceCache(pending.destination),
+    ]);
+    try {
+      const { broadcastToAccount } = await import('./websocket.js');
+      broadcastToAccount(pending.destination, {
+        type: 'balance_update',
+        action: 'multisig_payment_received',
+        source: pending.sourcePublicKey,
+        destination: pending.destination,
+        amount: pending.amount,
+        assetCode: pending.assetCode || 'XLM',
+        hash: result.hash,
+      });
+    } catch (wsErr) {
+      logger.warn('multiSig.submit.wsNotification.failed', { destination: pending.destination, error: wsErr.message });
+    }
+  } else {
+    await invalidateBalanceCache(pending.sourcePublicKey);
+  }
 
   await eventMonitor.publishEvent(pending.sourcePublicKey, {
     type: 'MultiSigTransactionSubmitted',
