@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, Map, Symbol,
-    Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, vec, Address, BytesN, Env,
+    IntoVal, Map, Symbol, Val, Vec,
 };
 
 // ── Storage keys ────────────────────────────────────────────────────────────
@@ -10,6 +10,20 @@ const ADMIN: Symbol = symbol_short!("ADMIN");
 const PAUSED: Symbol = symbol_short!("PAUSED");
 const MKT_CNT: Symbol = symbol_short!("MKT_CNT");
 const TREASURY: Symbol = symbol_short!("TREASURY");
+/// Collateral token every market is denominated in and escrows into.
+const TOKEN: Symbol = symbol_short!("TOKEN");
+
+// ── Fixed-point / bond constants ────────────────────────────────────────────
+
+/// Base fixed-point precision (7 decimals), matching the native stroop
+/// granularity of Stellar asset amounts. Used to size `MIN_DISPUTE_BOND`
+/// below and as the reference unit scale for payout dust accounting.
+const PRECISION: i128 = 10_000_000;
+
+/// Minimum collateral a disputer must escrow to open a dispute (1 whole
+/// token at PRECISION's 7-decimal granularity). Prevents zero-cost/dust
+/// disputes from stalling market resolution indefinitely.
+const MIN_DISPUTE_BOND: i128 = PRECISION;
 
 /// Upper bound on the number of markets `batch_redeem` will process in one
 /// call. Each redemption performs several storage reads/writes and emits an
@@ -43,6 +57,11 @@ pub struct Market {
     pub lp_pool: i128,
     /// Accumulated trading fees claimable by LPs.
     pub lp_fees: i128,
+    /// PRECISION-scaled fractional remainder carried forward between
+    /// `redeem` calls (see `PRECISION`). This is sub-base-unit dust, not
+    /// whole token units — it is flushed into `lp_fees` once enough of it
+    /// accumulates to cover one whole base unit.
+    pub dust: i128,
     pub status: MarketStatus,
     pub outcome: Option<bool>, // true = YES won
     pub dispute_bond: i128,
@@ -116,15 +135,21 @@ pub struct PredictionMarket;
 impl PredictionMarket {
     // ── Admin ────────────────────────────────────────────────────────────────
 
-    pub fn init(env: Env, admin: Address, treasury: Address) -> Result<(), Error> {
+    pub fn init(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        token_address: Address,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&ADMIN) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&ADMIN, &admin);
         env.storage().instance().set(&TREASURY, &treasury);
+        env.storage().instance().set(&TOKEN, &token_address);
         env.storage().instance().set(&PAUSED, &false);
         env.storage().instance().set(&MKT_CNT, &0u32);
-        Self::emit_admin(&env, symbol_short!("init"), (admin, treasury));
+        Self::emit_admin(&env, symbol_short!("init"), (admin, treasury, token_address));
         Ok(())
     }
 
@@ -141,6 +166,36 @@ impl PredictionMarket {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&PAUSED, &false);
         Self::emit_admin(&env, symbol_short!("unpaused"), caller);
+        Ok(())
+    }
+
+    /// Emergency WASM upgrade. Admin-gated: the currently installed contract
+    /// code is replaced with `new_wasm_hash`, which must already be uploaded
+    /// on-chain via the deployer's `upload_contract_wasm`. Instance and
+    /// persistent storage (markets, positions, admin/treasury keys) are
+    /// untouched by this call — only the executable code changes.
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        Self::emit_admin(&env, symbol_short!("upgraded"), (caller, new_wasm_hash));
+        Ok(())
+    }
+
+    /// Emergency containment for a compromised/misbehaving market. Admin-gated:
+    /// cancels the market so every holder can recover their position through
+    /// the existing `redeem` → cancelled-market refund path (1:1 share refund,
+    /// plus real collateral return for `split`-originated positions).
+    pub fn emergency_drain_market(env: Env, caller: Address, market_id: u32) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        let mut market = Self::load_market(&env, market_id)?;
+        if market.status == MarketStatus::Cancelled {
+            return Err(Error::MarketAlreadyCancelled);
+        }
+        market.status = MarketStatus::Cancelled;
+        Self::save_market(&env, market_id, &market);
+        Self::emit_admin(&env, symbol_short!("drained"), (market_id, caller));
         Ok(())
     }
 
@@ -164,6 +219,7 @@ impl PredictionMarket {
             no_pool: 0,
             lp_pool: 0,
             lp_fees: 0,
+            dust: 0,
             status: MarketStatus::Open,
             outcome: None,
             dispute_bond: 0,
@@ -234,11 +290,19 @@ impl PredictionMarket {
     ) -> Result<(), Error> {
         disputer.require_auth();
         Self::require_not_paused(&env)?;
+        if bond < MIN_DISPUTE_BOND {
+            return Err(Error::InvalidAmount);
+        }
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Closed)?;
         if market.outcome.is_none() {
             return Err(Error::InvalidOutcome);
         }
+        // Escrow the bond into the contract before flipping status, so a
+        // failed/insufficient transfer aborts the whole call instead of
+        // leaving a market marked Disputed with no collateral behind it.
+        let token_client = token::Client::new(&env, &Self::token_address(&env)?);
+        token_client.transfer(&disputer, &env.current_contract_address(), &bond);
         market.status = MarketStatus::Disputed;
         market.disputer = Some(disputer.clone());
         market.dispute_bond = bond;
@@ -247,7 +311,13 @@ impl PredictionMarket {
         Ok(())
     }
 
-    /// Admin upholds dispute → emergency resolve
+    /// Admin upholds dispute → emergency resolve.
+    ///
+    /// NOTE: this does not yet return `market.dispute_bond` to the disputer.
+    /// Now that `dispute` escrows a real token bond (#1258), an upheld
+    /// dispute leaves that collateral stranded in the contract. Tracked as
+    /// follow-up work — out of scope for the split/merge/dispute/upgrade
+    /// fixes this change makes.
     pub fn admin_uphold_dispute(
         env: Env,
         caller: Address,
@@ -391,7 +461,7 @@ impl PredictionMarket {
     pub fn redeem(env: Env, redeemer: Address, market_id: u32) -> Result<i128, Error> {
         redeemer.require_auth();
         Self::require_not_paused(&env)?;
-        let market = Self::load_market(&env, market_id)?;
+        let mut market = Self::load_market(&env, market_id)?;
         if market.status == MarketStatus::Cancelled {
             return Self::refund_cancelled(&env, &redeemer, market_id, &market);
         }
@@ -414,7 +484,30 @@ impl PredictionMarket {
             market.no_shares
         };
         let payout = if total_winning > 0 {
-            (winning_shares * total_pool) / total_winning
+            // Single combined multiply-then-divide (not two chained
+            // divisions, which would floor twice and lose untracked value)
+            // computes the payout at PRECISION's 7-decimal granularity in
+            // one step. The only information this loses is a fraction
+            // smaller than 1/PRECISION of one base unit (stroop) per
+            // redeemer — negligible and, unlike plain
+            // `(winning_shares * total_pool) / total_winning`, fully
+            // captured below instead of silently discarded.
+            let scaled_payout = (winning_shares * PRECISION * total_pool) / total_winning;
+            let payout = scaled_payout / PRECISION;
+            // `dust_scaled` is a sub-base-unit fraction (always < PRECISION,
+            // i.e. < 1 real token unit), never itself a payable whole token
+            // amount. Carry it forward in the market's scaled dust
+            // accumulator and only flush whole base units into `lp_fees`
+            // once enough of it has accumulated, so nothing is ever over-
+            // or under-credited.
+            let dust_scaled = scaled_payout % PRECISION;
+            market.dust += dust_scaled;
+            if market.dust >= PRECISION {
+                let whole_units = market.dust / PRECISION;
+                market.lp_fees += whole_units;
+                market.dust -= whole_units * PRECISION;
+            }
+            payout
         } else {
             0
         };
@@ -424,6 +517,7 @@ impl PredictionMarket {
         } else {
             pos.no_shares = 0;
         }
+        Self::save_market(&env, market_id, &market);
         Self::save_position(&env, market_id, &redeemer, &pos);
         Self::emit(&env, symbol_short!("redeemed"), (market_id, redeemer, payout));
         Ok(payout)
@@ -578,8 +672,16 @@ impl PredictionMarket {
     ) -> Result<(), Error> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
         let market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        // Pull 1:1 collateral into the contract escrow before minting any
+        // shares — a failed/insufficient transfer aborts the whole call, so
+        // YES/NO shares can never be minted without backing collateral.
+        let token_client = token::Client::new(&env, &Self::token_address(&env)?);
+        token_client.transfer(&caller, &env.current_contract_address(), &amount);
         let mut pos = Self::load_position(&env, market_id, &caller);
         pos.yes_shares += amount;
         pos.no_shares += amount;
@@ -597,16 +699,22 @@ impl PredictionMarket {
     ) -> Result<(), Error> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
         let market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
         let mut pos = Self::load_position(&env, market_id, &caller);
         if pos.yes_shares < amount || pos.no_shares < amount {
             return Err(Error::InsufficientFunds);
         }
+        // Burn shares before releasing collateral (checks-effects-interactions).
         pos.yes_shares -= amount;
         pos.no_shares -= amount;
         pos.split_tokens -= amount.min(pos.split_tokens);
         Self::save_position(&env, market_id, &caller, &pos);
+        let token_client = token::Client::new(&env, &Self::token_address(&env)?);
+        token_client.transfer(&env.current_contract_address(), &caller, &amount);
         Self::emit(&env, symbol_short!("merged"), (market_id, caller, amount));
         Ok(())
     }
@@ -741,6 +849,10 @@ impl PredictionMarket {
         symbol_short!("TRES_BAL")
     }
 
+    fn token_address(env: &Env) -> Result<Address, Error> {
+        env.storage().instance().get(&TOKEN).ok_or(Error::NotInitialized)
+    }
+
     fn refund_cancelled(
         env: &Env,
         redeemer: &Address,
@@ -752,9 +864,21 @@ impl PredictionMarket {
         if refund == 0 {
             return Err(Error::NothingToRedeem);
         }
+        // `split` escrows real collateral 1:1 into the contract; return it
+        // here so a market cancellation can't strand split-originated
+        // collateral with no way back out. Shares from `buy_yes`/`buy_no`
+        // are not collateral-backed in this contract yet (pre-existing,
+        // out of scope for this change) so only `split_tokens` moves real
+        // funds.
+        let collateral = pos.split_tokens.min(refund);
         pos.yes_shares = 0;
         pos.no_shares = 0;
+        pos.split_tokens -= collateral;
         Self::save_position(env, market_id, redeemer, &pos);
+        if collateral > 0 {
+            let token_client = token::Client::new(env, &Self::token_address(env)?);
+            token_client.transfer(&env.current_contract_address(), redeemer, &collateral);
+        }
         Self::emit(env, symbol_short!("refunded"), (market_id, redeemer.clone(), refund));
         let _ = market;
         Ok(refund)
