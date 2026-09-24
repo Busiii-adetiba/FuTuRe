@@ -114,9 +114,47 @@ export function applySlippage(amount, slippageBps = 50) {
 
 // ── Transaction Building ──────────────────────────────────────────────────────
 
+/** Max number of candidate paths tried before giving up. */
+const MAX_PATH_ATTEMPTS = 3;
+
+/**
+ * Horizon result codes meaning "this route no longer has the liquidity we
+ * quoted" — a different path may still succeed. Strict-send failures surface
+ * as op_under_dest_min / op_too_few_offers; path_no_path and op_over_sendmax
+ * are also treated as route failures.
+ */
+const PATH_FAILURE_CODES = new Set([
+  'path_no_path',
+  'op_over_sendmax',
+  'op_over_source_max',
+  'op_under_dest_min',
+  'op_too_few_offers',
+]);
+
+/** Collect transaction- and operation-level result codes from a Horizon submit error. */
+function resultCodes(err) {
+  const codes = err?.response?.data?.extras?.result_codes ?? err?.data?.extras?.result_codes;
+  if (!codes) return [];
+  return [codes.transaction, ...(codes.operations || [])].filter(Boolean);
+}
+
+function isPathFailure(err) {
+  return resultCodes(err).some((c) => PATH_FAILURE_CODES.has(c));
+}
+
+function pathKey(path) {
+  return path.join('>');
+}
+
 /**
  * Build and submit a strict-send path payment.
  * Sends exactly `sendAmount` of `sendAsset`, receives at least `minDestAmount` of `destAsset`.
+ *
+ * Up to {@link MAX_PATH_ATTEMPTS} candidate paths are tried. If a submission
+ * fails because the route's liquidity moved (see PATH_FAILURE_CODES), fresh
+ * paths are re-queried and the next best untried path is submitted — but only
+ * if its quoted destination amount still meets the original slippage floor
+ * (`destMin`), which is never relaxed between attempts.
  * @param {object} opts
  * @param {string} opts.sourceSecret - Secret key of the sending account
  * @param {string} opts.destination - Stellar public key of the recipient
@@ -125,7 +163,8 @@ export function applySlippage(amount, slippageBps = 50) {
  * @param {{code: string, issuer?: string}} opts.destAsset - Asset the recipient should receive
  * @param {Array<string|{code: string, issuer?: string}>} [opts.path=[]] - Explicit conversion path; when omitted, the best path from {@link findPaths} is used
  * @param {number} [opts.slippageBps=50] - Slippage tolerance in basis points applied to the expected destination amount
- * @returns {Promise<{hash: string, ledger: number, success: boolean, destMin: string}>} Submission result
+ * @param {number|string} [opts.minDestAmount] - Explicit destination floor; overrides the slippage-derived `destMin`
+ * @returns {Promise<{hash: string, ledger: number, success: boolean, destMin: string, attempts: number, fallbackUsed: boolean}>} Submission result
  * @throws {Error} If no path is found between the assets, or Horizon submission fails (with a user-friendly `message` and `.code`)
  */
 export async function sendPathPayment({
@@ -136,6 +175,7 @@ export async function sendPathPayment({
   destAsset,
   path = [],
   slippageBps = 50,
+  minDestAmount,
 }) {
   const keypair = StellarSDK.Keypair.fromSecret(sourceSecret);
   const sourcePublicKey = keypair.publicKey();
@@ -143,55 +183,129 @@ export async function sendPathPayment({
   const srcAsset = toAsset(sendAsset.code, sendAsset.issuer);
   const dstAsset = toAsset(destAsset.code, destAsset.issuer);
 
-  // Find best path if not provided — single call reused for both resolvedPath and destMin
-  let resolvedPath = path;
+  const discover = () => findPaths({ sourceAsset: sendAsset, sourceAmount: sendAmount, destinationAsset: destAsset });
+  const intermediate = (codes) => codes.filter(p => p !== sendAsset.code && p !== destAsset.code);
+
+  // Candidate paths: { assets: Asset[], key, destinationAmount }
+  const toCandidate = (p) => {
+    const codes = intermediate(p.path);
+    return { assets: codes.map(code => toAsset(code)), key: pathKey(codes), destinationAmount: p.destinationAmount };
+  };
+
+  const discovered = await discover();
+  let candidates;
   let bestDestAmount = sendAmount;
 
-  if (!resolvedPath.length) {
-    const paths = await findPaths({ sourceAsset: sendAsset, sourceAmount: sendAmount, destinationAsset: destAsset });
-    if (!paths.length) throw new Error('No path found between assets');
-    bestDestAmount = paths[0].destinationAmount;
-    resolvedPath = paths[0].path
-      .filter(p => p !== sendAsset.code && p !== destAsset.code)
-      .map(code => toAsset(code));
+  if (!path.length) {
+    if (!discovered.length) throw new Error('No path found between assets');
+    bestDestAmount = discovered[0].destinationAmount;
+    candidates = discovered.slice(0, MAX_PATH_ATTEMPTS).map(toCandidate);
   } else {
-    resolvedPath = resolvedPath.map(p => toAsset(p.code || p, p.issuer));
-    // Still need bestDestAmount when an explicit path is provided — do one lookup
-    const paths = await findPaths({ sourceAsset: sendAsset, sourceAmount: sendAmount, destinationAsset: destAsset });
-    if (paths.length) bestDestAmount = paths[0].destinationAmount;
+    const explicit = path.map(p => toAsset(p.code || p, p.issuer));
+    const explicitKey = pathKey(path.map(p => p.code || p));
+    if (discovered.length) bestDestAmount = discovered[0].destinationAmount;
+    candidates = [
+      { assets: explicit, key: explicitKey, destinationAmount: bestDestAmount },
+      ...discovered.map(toCandidate).filter(c => c.key !== explicitKey),
+    ].slice(0, MAX_PATH_ATTEMPTS);
   }
 
-  const destMin = applySlippage(bestDestAmount, slippageBps);
+  // The slippage floor is fixed from the initial quote and never relaxed on fallback.
+  const destMin = minDestAmount != null
+    ? parseFloat(minDestAmount).toFixed(7)
+    : applySlippage(bestDestAmount, slippageBps);
+  const floor = parseFloat(destMin);
 
-  const account = await withHorizonRetry(() => getHorizonServer().loadAccount(sourcePublicKey));
-
-  const tx = new StellarSDK.TransactionBuilder(account, {
-    fee: StellarSDK.BASE_FEE,
-    networkPassphrase: networkPassphrase(),
-  })
-    .addOperation(StellarSDK.Operation.pathPaymentStrictSend({
-      sendAsset: srcAsset,
-      sendAmount: sendAmount.toString(),
-      destination,
-      destAsset: dstAsset,
-      destMin,
-      path: resolvedPath,
-    }))
-    .setTimeout(30)
-    .build();
-
-  tx.sign(keypair);
-
+  const tried = new Set();
   let result;
-  try {
-    result = await withHorizonRetry(() => getHorizonServer().submitTransaction(tx));
-  } catch (err) {
-    const code = extractStellarErrorCode(err);
+  let lastError;
+  let attempts = 0;
+
+  while (attempts < MAX_PATH_ATTEMPTS) {
+    const candidate = candidates.find(c => !tried.has(c.key));
+    if (!candidate) break;
+    tried.add(candidate.key);
+
+    if (attempts > 0 && parseFloat(candidate.destinationAmount) < floor) {
+      logger.info('pathPayment.fallback.skipped', {
+        source: sourcePublicKey,
+        path: candidate.key,
+        quotedDestAmount: candidate.destinationAmount,
+        destMin,
+        reason: 'outside_slippage_tolerance',
+      });
+      continue;
+    }
+
+    attempts++;
+    // Reload each attempt: a failed on-chain submission still consumes the sequence number.
+    const account = await withHorizonRetry(() => getHorizonServer().loadAccount(sourcePublicKey));
+
+    const tx = new StellarSDK.TransactionBuilder(account, {
+      fee: StellarSDK.BASE_FEE,
+      networkPassphrase: networkPassphrase(),
+    })
+      .addOperation(StellarSDK.Operation.pathPaymentStrictSend({
+        sendAsset: srcAsset,
+        sendAmount: sendAmount.toString(),
+        destination,
+        destAsset: dstAsset,
+        destMin,
+        path: candidate.assets,
+      }))
+      .setTimeout(30)
+      .build();
+
+    tx.sign(keypair);
+
+    try {
+      result = await withHorizonRetry(() => getHorizonServer().submitTransaction(tx));
+      if (attempts > 1) {
+        logger.info('pathPayment.fallback.success', {
+          source: sourcePublicKey,
+          destination,
+          attempt: attempts,
+          path: candidate.key,
+          quotedDestAmount: candidate.destinationAmount,
+          destMin,
+          hash: result.hash,
+        });
+      }
+      break;
+    } catch (err) {
+      lastError = err;
+      if (!isPathFailure(err)) break;
+
+      logger.warn('pathPayment.fallback.pathFailed', {
+        source: sourcePublicKey,
+        destination,
+        attempt: attempts,
+        path: candidate.key,
+        resultCodes: resultCodes(err),
+      });
+
+      // Liquidity moved — re-query so fallbacks are judged on fresh quotes.
+      try {
+        const fresh = (await discover()).slice(0, MAX_PATH_ATTEMPTS).map(toCandidate);
+        if (fresh.length) candidates = fresh;
+      } catch (requeryErr) {
+        logger.warn('pathPayment.fallback.requeryFailed', { error: requeryErr.message });
+      }
+    }
+  }
+
+  if (!result) {
+    if (!lastError) {
+      const noPath = new Error('No viable path within slippage tolerance');
+      noPath.code = 'path_no_path';
+      throw noPath;
+    }
+    const code = extractStellarErrorCode(lastError);
     const { userMessage } = getStellarErrorInfo(code);
-    logger.error('pathPayment.send.failed', { source: sourcePublicKey, destination, code, error: err.message });
+    logger.error('pathPayment.send.failed', { source: sourcePublicKey, destination, code, attempts, error: lastError.message });
     const mapped = new Error(userMessage);
     mapped.code = code;
-    mapped.original = err;
+    mapped.original = lastError;
     throw mapped;
   }
 
@@ -222,7 +336,14 @@ export async function sendPathPayment({
     });
   }).catch(err => logger.warn('db.pathPayment.save.failed', { error: err.message }));
 
-  return { hash: result.hash, ledger: result.ledger, success: result.successful, destMin };
+  return {
+    hash: result.hash,
+    ledger: result.ledger,
+    success: result.successful,
+    destMin,
+    attempts,
+    fallbackUsed: attempts > 1,
+  };
 }
 
 // ── Path Optimization ─────────────────────────────────────────────────────────
