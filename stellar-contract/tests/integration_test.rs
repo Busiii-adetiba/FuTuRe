@@ -1,11 +1,24 @@
 #![cfg(feature = "testutils")]
 
-use prediction_market::{Error, PredictionMarket, PredictionMarketClient};
+use prediction_market::{
+    Error, MarketStatus, PredictionMarket, PredictionMarketClient, INSTANCE_BUMP_THRESHOLD,
+    PERSISTENT_BUMP_THRESHOLD,
+};
 use soroban_sdk::{
     symbol_short,
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Events as _, Ledger as _,
+    },
+    token::{Client as TokenClient, StellarAssetClient},
+    vec, Address, Env, IntoVal, String,
     testutils::{Address as _, Events as _},
     token, vec, Address, BytesN, Env, IntoVal, String,
 };
+
+const CLOSE_IN: u64 = 1_000;
+const RESOLVE_WINDOW: u64 = 1_000;
+const FUNDING: i128 = 1_000_000_000_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -17,6 +30,37 @@ fn setup() -> (Env, PredictionMarketClient<'static>, Address, Address, Address) 
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
     let oracle = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    client.init(&admin, &treasury, &token);
+    StellarAssetClient::new(&env, &token).mint(&admin, &FUNDING);
+    (env, client, admin, treasury, oracle)
+}
+
+/// Generate an address holding `FUNDING` units of the market token.
+fn funded(env: &Env, client: &PredictionMarketClient) -> Address {
+    let addr = Address::generate(env);
+    StellarAssetClient::new(env, &client.get_token()).mint(&addr, &FUNDING);
+    addr
+}
+
+fn token_balance(env: &Env, client: &PredictionMarketClient, addr: &Address) -> i128 {
+    TokenClient::new(env, &client.get_token()).balance(addr)
+}
+
+/// Create a market that closes `CLOSE_IN` seconds from now.
+fn create(env: &Env, client: &PredictionMarketClient, creator: &Address, oracle: &Address) -> u32 {
+    let now = env.ledger().timestamp();
+    client.create_market(
+        creator,
+        &question(env),
+        oracle,
+        &(now + CLOSE_IN),
+        &(now + CLOSE_IN + RESOLVE_WINDOW),
+    )
+}
+
+fn advance(env: &Env, secs: u64) {
+    env.ledger().with_mut(|l| l.timestamp += secs);
     // Tests below that don't move real collateral (everything except
     // dispute/split/merge) don't need to observe this token, so a throwaway
     // address here keeps every pre-existing call site untouched. Tests that
@@ -64,11 +108,11 @@ fn question(env: &Env) -> String {
 #[test]
 fn test_happy_path_full_lifecycle() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let user_yes = Address::generate(&env);
-    let user_no = Address::generate(&env);
+    let user_yes = funded(&env, &client);
+    let user_no = funded(&env, &client);
 
     // create
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
 
     // seed
     client.seed_market(&admin, &mid, &1_000_000);
@@ -103,13 +147,16 @@ fn test_happy_path_full_lifecycle() {
 
 #[test]
 fn test_dispute_admin_upholds_emergency_resolve() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user = funded(&env, &client);
+    let disputer = funded(&env, &client);
     let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
     let user = Address::generate(&env);
     let disputer = Address::generate(&env);
     let bond = 10_000_000i128; // == MIN_DISPUTE_BOND
     token_sac.mint(&disputer, &bond);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
     client.buy_yes(&user, &mid, &100_000, &1);
     client.close_market(&admin, &mid);
@@ -134,12 +181,14 @@ fn test_dispute_admin_upholds_emergency_resolve() {
 
 #[test]
 fn test_dispute_rejected_bond_slashed_to_treasury() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let disputer = funded(&env, &client);
     let (env, client, admin, _treasury, oracle, _token, token_sac) = setup_with_token();
     let disputer = Address::generate(&env);
     let bond = 10_000_000i128; // == MIN_DISPUTE_BOND
     token_sac.mint(&disputer, &bond);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
     client.close_market(&admin, &mid);
     client.oracle_report(&oracle, &mid, &true);
@@ -162,10 +211,10 @@ fn test_dispute_rejected_bond_slashed_to_treasury() {
 #[test]
 fn test_cancel_and_refund_all_positions() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let user_a = Address::generate(&env);
-    let user_b = Address::generate(&env);
+    let user_a = funded(&env, &client);
+    let user_b = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
     client.buy_yes(&user_a, &mid, &100_000, &1);
     client.buy_no(&user_b, &mid, &100_000, &1);
@@ -184,10 +233,10 @@ fn test_cancel_and_refund_all_positions() {
 #[test]
 fn test_lp_add_trade_claim_fees_remove() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let lp = Address::generate(&env);
-    let trader = Address::generate(&env);
+    let lp = funded(&env, &client);
+    let trader = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
 
     // add liquidity
     let lp_shares = client.add_liquidity(&lp, &mid, &1_000_000);
@@ -214,11 +263,11 @@ fn test_lp_add_trade_claim_fees_remove() {
 #[test]
 fn test_lp_proportional_share_minting() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let lp_a = Address::generate(&env);
-    let lp_b = Address::generate(&env);
-    let trader = Address::generate(&env);
+    let lp_a = funded(&env, &client);
+    let lp_b = funded(&env, &client);
+    let trader = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
 
     // LP-A deposits 500_000 into an empty LP pool → gets 500_000 shares (1:1 bootstrap)
@@ -254,10 +303,10 @@ fn test_lp_proportional_share_minting() {
 #[test]
 fn test_lp_remove_liquidity_proportional_payout() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let lp_a = Address::generate(&env);
-    let lp_b = Address::generate(&env);
+    let lp_a = funded(&env, &client);
+    let lp_b = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
 
     // LP-A deposits 1_000_000 first (bootstrap: gets 1_000_000 shares, lp_pool = 1_000_000)
     let shares_a = client.add_liquidity(&lp_a, &mid, &1_000_000);
@@ -290,10 +339,10 @@ fn test_lp_remove_liquidity_proportional_payout() {
 #[test]
 fn test_claim_lp_fees_proportional_to_shares() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let lp_a = Address::generate(&env);
-    let lp_b = Address::generate(&env);
+    let lp_a = funded(&env, &client);
+    let lp_b = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
 
     // LP-A deposits 2_000 (bootstrap, gets 2_000 shares)
     client.add_liquidity(&lp_a, &mid, &2_000);
@@ -320,13 +369,14 @@ fn test_claim_lp_fees_proportional_to_shares() {
 #[test]
 fn test_batch_redeem_across_three_markets() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let user = Address::generate(&env);
+    let user = funded(&env, &client);
 
     let mut ids = vec![&env];
     for _ in 0..3 {
-        let mid = client.create_market(&admin, &question(&env), &oracle);
+        let mid = create(&env, &client, &admin, &oracle);
         client.seed_market(&admin, &mid, &1_000_000);
         client.buy_yes(&user, &mid, &100_000, &1);
+        advance(&env, CLOSE_IN);
         client.close_market(&admin, &mid);
         client.oracle_report(&oracle, &mid, &true);
         client.finalize(&mid);
@@ -342,11 +392,11 @@ fn test_batch_redeem_across_three_markets() {
 #[test]
 fn test_batch_redeem_partial_failure() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let user = Address::generate(&env);
+    let user = funded(&env, &client);
 
     let mut ids = vec![&env];
     // First market: resolve with YES (user has YES shares)
-    let mid1 = client.create_market(&admin, &question(&env), &oracle);
+    let mid1 = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid1, &1_000_000);
     client.buy_yes(&user, &mid1, &100_000, &1);
     client.close_market(&admin, &mid1);
@@ -355,7 +405,7 @@ fn test_batch_redeem_partial_failure() {
     ids.push_back(mid1);
 
     // Second market: resolve with NO (user has YES shares, gets nothing)
-    let mid2 = client.create_market(&admin, &question(&env), &oracle);
+    let mid2 = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid2, &1_000_000);
     client.buy_yes(&user, &mid2, &100_000, &1);
     client.close_market(&admin, &mid2);
@@ -376,11 +426,13 @@ fn test_batch_redeem_partial_failure() {
 
 #[test]
 fn test_split_sell_half_merge_remaining() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user = funded(&env, &client);
     let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
     let user = Address::generate(&env);
     token_sac.mint(&user, &200_000);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
 
     // split: 1:1 collateral is pulled from the user into contract escrow
@@ -450,9 +502,9 @@ fn test_merge_returns_collateral_only_up_to_split_tokens() {
 #[test]
 fn test_buy_yes_slippage_exceeded() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let user = Address::generate(&env);
+    let user = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
 
     // min_shares_out impossibly high
@@ -468,9 +520,9 @@ fn test_buy_yes_slippage_exceeded() {
 #[test]
 fn test_emergency_pause_blocks_mutations_unpause_succeeds() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let user = Address::generate(&env);
+    let user = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
 
     // pause
@@ -487,7 +539,7 @@ fn test_emergency_pause_blocks_mutations_unpause_succeeds() {
     assert_eq!(err, Error::ContractPaused);
 
     let err = client
-        .try_create_market(&admin, &question(&env), &oracle)
+        .try_create_market(&admin, &question(&env), &oracle, &CLOSE_IN, &(CLOSE_IN * 2))
         .unwrap_err()
         .unwrap();
     assert_eq!(err, Error::ContractPaused);
@@ -506,7 +558,7 @@ fn test_emergency_pause_blocks_mutations_unpause_succeeds() {
 fn test_create_market_emits_created_event() {
     let (env, client, admin, _treasury, oracle) = setup();
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
 
     let events = env.events().all();
     let (contract_id, topics, data) = events.last().unwrap();
@@ -528,9 +580,9 @@ fn test_create_market_emits_created_event() {
 #[test]
 fn test_buy_yes_emits_traded_event() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let user = Address::generate(&env);
+    let user = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
     let shares = client.buy_yes(&user, &mid, &100_000, &1);
 
@@ -553,9 +605,9 @@ fn test_buy_yes_emits_traded_event() {
 #[test]
 fn test_finalize_emits_resolved_event() {
     let (env, client, admin, _treasury, oracle) = setup();
-    let user = Address::generate(&env);
+    let user = funded(&env, &client);
 
-    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
     client.buy_yes(&user, &mid, &100_000, &1);
     client.close_market(&admin, &mid);
@@ -575,6 +627,155 @@ fn test_finalize_emits_resolved_event() {
     assert_eq!(data, (mid, Some(true)).into_val(&env));
 }
 
+// ── 11. Token custody (#1247 / #1248) ────────────────────────────────────────
+
+#[test]
+fn test_trades_and_liquidity_move_real_tokens() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let buyer = funded(&env, &client);
+    let lp = funded(&env, &client);
+
+    let mid = create(&env, &client, &admin, &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.buy_yes(&buyer, &mid, &100_000, &1);
+    client.add_liquidity(&lp, &mid, &500_000);
+
+    assert_eq!(token_balance(&env, &client, &buyer), FUNDING - 100_000);
+    assert_eq!(token_balance(&env, &client, &lp), FUNDING - 500_000);
+    assert_eq!(
+        token_balance(&env, &client, &client.address),
+        2 * 1_000_000 + 100_000 + 500_000
+    );
+}
+
+#[test]
+fn test_buy_and_add_liquidity_fail_without_tokens() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let broke = Address::generate(&env);
+    let mid = create(&env, &client, &admin, &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+
+    assert!(client.try_buy_yes(&broke, &mid, &1_000_000_000, &1).is_err());
+    assert!(client.try_add_liquidity(&broke, &mid, &1_000).is_err());
+    assert_eq!(client.get_position(&mid, &broke).yes_shares, 0);
+}
+
+#[test]
+fn test_redeem_pays_winner_in_tokens() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let winner = funded(&env, &client);
+    let mid = create(&env, &client, &admin, &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.buy_yes(&winner, &mid, &100_000, &1);
+    advance(&env, CLOSE_IN);
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+    client.finalize(&mid);
+
+    let before = token_balance(&env, &client, &winner);
+    let payout = client.redeem(&winner, &mid);
+    assert_eq!(token_balance(&env, &client, &winner), before + payout);
+}
+
+// ── 12. State TTL (#1249) ────────────────────────────────────────────────────
+
+#[test]
+fn test_storage_ttl_extended_on_access() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user = funded(&env, &client);
+    let mid = create(&env, &client, &admin, &oracle);
+    client.buy_yes(&user, &mid, &100_000, &1);
+    client.get_market(&mid);
+
+    env.as_contract(&client.address, || {
+        assert!(env.storage().instance().get_ttl() >= INSTANCE_BUMP_THRESHOLD);
+        let mkt_key = (symbol_short!("MKT"), mid);
+        assert!(env.storage().persistent().get_ttl(&mkt_key) >= PERSISTENT_BUMP_THRESHOLD);
+        let pos_key = (symbol_short!("POS"), mid, user.clone());
+        assert!(env.storage().persistent().get_ttl(&pos_key) >= PERSISTENT_BUMP_THRESHOLD);
+    });
+}
+
+// ── 13. Deadlines (#1250) ────────────────────────────────────────────────────
+
+#[test]
+fn test_create_market_rejects_invalid_deadlines() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    advance(&env, 100);
+    let err = client
+        .try_create_market(&admin, &question(&env), &oracle, &100, &500)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidDeadline);
+    let err = client
+        .try_create_market(&admin, &question(&env), &oracle, &500, &500)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidDeadline);
+}
+
+#[test]
+fn test_trading_rejected_after_close_time() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user = funded(&env, &client);
+    let mid = create(&env, &client, &admin, &oracle);
+
+    advance(&env, CLOSE_IN - 1);
+    client.buy_yes(&user, &mid, &100_000, &1);
+
+    advance(&env, 1);
+    let err = client.try_buy_yes(&user, &mid, &100_000, &1).unwrap_err().unwrap();
+    assert_eq!(err, Error::TradingClosed);
+    let err = client.try_buy_no(&user, &mid, &100_000, &1).unwrap_err().unwrap();
+    assert_eq!(err, Error::TradingClosed);
+    let err = client.try_add_liquidity(&user, &mid, &100_000).unwrap_err().unwrap();
+    assert_eq!(err, Error::TradingClosed);
+}
+
+#[test]
+fn test_oracle_cannot_report_before_close_time() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let mid = create(&env, &client, &admin, &oracle);
+    // Admin may halt trading early, but the oracle still has to wait.
+    client.close_market(&admin, &mid);
+    let err = client.try_oracle_report(&oracle, &mid, &true).unwrap_err().unwrap();
+    assert_eq!(err, Error::MarketNotExpired);
+
+    advance(&env, CLOSE_IN);
+    client.oracle_report(&oracle, &mid, &true);
+}
+
+#[test]
+fn test_creator_cannot_close_before_close_time() {
+    let (env, client, _admin, _treasury, oracle) = setup();
+    let creator = funded(&env, &client);
+    let mid = create(&env, &client, &creator, &oracle);
+    let err = client.try_close_market(&creator, &mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::Unauthorized);
+    advance(&env, CLOSE_IN);
+    client.close_market(&creator, &mid);
+}
+
+#[test]
+fn test_timeout_refund_after_resolution_deadline() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user = funded(&env, &client);
+    let mid = create(&env, &client, &admin, &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.buy_yes(&user, &mid, &100_000, &1);
+
+    advance(&env, CLOSE_IN + RESOLVE_WINDOW);
+    let err = client.try_emergency_timeout_refund(&mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::ResolutionDeadlineNotReached);
+
+    advance(&env, 1);
+    client.emergency_timeout_refund(&mid);
+    assert_eq!(client.get_market(&mid).status, MarketStatus::Cancelled);
+
+    let before = token_balance(&env, &client, &user);
+    let refund = client.redeem(&user, &mid);
+    assert!(refund > 0);
+    assert_eq!(token_balance(&env, &client, &user), before + refund);
 // ── 11. Zero-liquidity swaps (#1262) ─────────────────────────────────────────
 //
 // Trades against a market with no reserves, or with non-positive amounts, must
