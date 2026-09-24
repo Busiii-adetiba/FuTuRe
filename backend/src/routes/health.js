@@ -5,7 +5,7 @@ import { eventMonitor, eventStore } from '../eventSourcing/index.js';
 import { auditLogger } from '../security/index.js';
 import { requireAuth } from '../middleware/auth.js';
 import { analytics as cacheAnalytics, monitor as cacheMonitor } from '../cache/appCache.js';
-import prisma from '../db/client.js';
+import prisma, { getDBConnectionState } from '../db/client.js';
 import { getMetrics as getBackupMetrics } from '../backup/manager.js';
 import { RedisBackend } from '../cache/redis.js';
 import { redisBackend as mobileAuthRedisBackend } from '../mobile/redisStore.js';
@@ -226,6 +226,14 @@ async function checkDatabaseConnectivity() {
   }
 }
 
+function checkPostgresConnectivity() {
+  const { state, error } = getDBConnectionState();
+  if (state === 'connected') return { status: 'healthy', state };
+  // Reconnection is still in progress (or has not started yet) — report
+  // degraded rather than unhealthy so orchestrators don't kill the instance.
+  return { status: 'degraded', state, ...(error ? { error } : {}) };
+}
+
 async function checkDependencies() {
   const checks = [];
 
@@ -337,6 +345,7 @@ router.get('/health', async (req, res) => {
     const mobileAuthCheck = await checkMobileAuthConnectivity();
     const emailCheck = await checkEmailServiceConnectivity();
     const wsCheck = await checkWebSocketConnectivity();
+    const postgresCheck = checkPostgresConnectivity();
 
     const healthChecks = [
       { name: 'stellar', status: stellarCheck.status },
@@ -350,6 +359,7 @@ router.get('/health', async (req, res) => {
       { name: 'mobileAuth', ...mobileAuthCheck },
       { name: 'email', ...emailCheck },
       { name: 'websocket', ...wsCheck },
+      { name: 'postgres', ...postgresCheck },
     ];
 
     // Calculate overall health (exclude unavailable services)
@@ -357,7 +367,8 @@ router.get('/health', async (req, res) => {
     const healthyCount = criticalChecks.filter((c) => c.status === 'healthy').length;
     const overallHealth =
       criticalChecks.length > 0 ? Math.round((healthyCount / criticalChecks.length) * 100) : 100;
-    const status = overallHealth >= 80 ? 'healthy' : overallHealth >= 50 ? 'degraded' : 'unhealthy';
+    let status = overallHealth >= 80 ? 'healthy' : overallHealth >= 50 ? 'degraded' : 'unhealthy';
+    if (status === 'healthy' && postgresCheck.status !== 'healthy') status = 'degraded';
 
     const healthData = {
       status,
@@ -414,6 +425,7 @@ router.get('/health/ready', async (req, res) => {
         mobileAuth: mobileAuthCheck.status,
         email: emailCheck.status,
         websocket: wsCheck.status,
+        postgres: checkPostgresConnectivity().status,
       },
     };
 

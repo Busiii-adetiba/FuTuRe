@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { requireAuth as authMiddleware } from '../middleware/auth.js';
 import { requireAdmin, requireRole } from '../middleware/adminAuth.js';
-import prisma from '../db/client.js';
+import prisma, { RequestAbortedError } from '../db/client.js';
 import {
   kycCollector,
   identityVerifier,
@@ -150,6 +150,8 @@ router.post('/aml/screen', authMiddleware, async (req, res) => {
     const result = await amlMonitor.screenTransaction(transaction, history || []);
     res.json(result);
   } catch (err) {
+    // Client disconnected — DB work was halted/rolled back; nobody to respond to.
+    if (err instanceof RequestAbortedError) return;
     res.status(500).json({ error: err.message });
   }
 });
@@ -245,6 +247,8 @@ router.post('/reports', requireRole('COMPLIANCE', 'ADMIN'), async (req, res) => 
     });
     res.status(201).json(report);
   } catch (err) {
+    // Client disconnected — DB work was halted/rolled back; nobody to respond to.
+    if (err instanceof RequestAbortedError) return;
     res.status(500).json({ error: err.message });
   }
 });
@@ -317,6 +321,8 @@ router.get('/reports/sar', requireAdmin, async (req, res) => {
 
     res.json(report);
   } catch (err) {
+    // Client disconnected — DB work was halted/rolled back; nobody to respond to.
+    if (err instanceof RequestAbortedError) return;
     res.status(500).json({ error: err.message });
   }
 });
@@ -368,6 +374,8 @@ router.get('/reports/ctr', requireAdmin, async (req, res) => {
 
     res.json(report);
   } catch (err) {
+    // Client disconnected — DB work was halted/rolled back; nobody to respond to.
+    if (err instanceof RequestAbortedError) return;
     res.status(500).json({ error: err.message });
   }
 });
@@ -431,6 +439,8 @@ router.patch('/reports/:id/file', requireAdmin, async (req, res) => {
       filedAt: record.filedAt,
     });
   } catch (err) {
+    // Client disconnected — DB work was halted/rolled back; nobody to respond to.
+    if (err instanceof RequestAbortedError) return;
     res.status(500).json({ error: err.message });
   }
 });
@@ -480,6 +490,8 @@ router.get('/aml/alerts', requireRole('COMPLIANCE', 'ADMIN'), async (req, res) =
       },
     });
   } catch (err) {
+    // Client disconnected — DB work was halted/rolled back; nobody to respond to.
+    if (err instanceof RequestAbortedError) return;
     res.status(500).json({ error: err.message });
   }
 });
@@ -501,6 +513,8 @@ router.patch('/aml/alerts/:id/review', requireRole('COMPLIANCE', 'ADMIN'), async
 
     res.json({ success: true, message: 'Alert marked as reviewed' });
   } catch (err) {
+    // Client disconnected — DB work was halted/rolled back; nobody to respond to.
+    if (err instanceof RequestAbortedError) return;
     res.status(500).json({ error: err.message });
   }
 });
