@@ -26,6 +26,8 @@ export const THRESHOLDS = Object.freeze({
   LARGE_TX: parseFloat(process.env.AML_LARGE_TX_THRESHOLD ?? '10000'),
   STRUCTURING: parseFloat(process.env.AML_STRUCTURING_THRESHOLD ?? '1000'),
   STRUCTURING_COUNT: parseInt(process.env.AML_STRUCTURING_COUNT ?? '3', 10),
+  STRUCTURING_LOWER: parseFloat(process.env.AML_STRUCTURING_LOWER ?? '100'),
+  STRUCTURING_VOLUME_RATIO: parseFloat(process.env.AML_STRUCTURING_VOLUME_RATIO ?? '0.85'),
   VELOCITY_LIMIT: parseFloat(process.env.AML_VELOCITY_LIMIT ?? '10000'),
   WINDOW_MS: DAY_MS,
   RAPID_TX_WINDOW_MS: parseInt(process.env.AML_RAPID_TX_WINDOW_MS ?? String(HOUR_MS), 10),
@@ -59,12 +61,40 @@ export function isNearThreshold(tx) {
   return amount >= THRESHOLDS.NEAR_THRESHOLD_LOW && amount < THRESHOLDS.LARGE_TX;
 }
 
+/**
+ * Structuring (smurfing) detection.
+ *
+ * Real structuring is breaking a large reporting amount (e.g. the $10,000
+ * FinCEN threshold) into multiple smaller transactions that aggregate close
+ * to or over that threshold. We therefore require BOTH:
+ *   1. enough smurfing-range transactions in the window (each in
+ *      [STRUCTURING_LOWER, LARGE_TX)), and
+ *   2. a cumulative volume near the reporting threshold
+ *      (≥ LARGE_TX * STRUCTURING_VOLUME_RATIO).
+ *
+ * Ordinary low-value consumer activity (coffee, lunch, small transfers) is
+ * excluded by the lower bound and never reaches the cumulative volume gate.
+ */
 export function isStructuring(tx, history = []) {
-  if (txAmount(tx) >= THRESHOLDS.STRUCTURING) return false;
-  const recentSmall = sameSenderInWindow(tx, history, THRESHOLDS.WINDOW_MS).filter(
-    (h) => txAmount(h) < THRESHOLDS.STRUCTURING
+  const amount = txAmount(tx);
+  if (amount >= THRESHOLDS.LARGE_TX) return false;
+
+  const recent = sameSenderInWindow(tx, history, THRESHOLDS.WINDOW_MS).filter(
+    (h) => {
+      const a = txAmount(h);
+      return a >= THRESHOLDS.STRUCTURING_LOWER && a < THRESHOLDS.LARGE_TX;
+    }
   );
-  return recentSmall.length >= THRESHOLDS.STRUCTURING_COUNT;
+
+  const inSmurfRange =
+    amount >= THRESHOLDS.STRUCTURING_LOWER && amount < THRESHOLDS.LARGE_TX;
+  const count = recent.length + (inSmurfRange ? 1 : 0);
+  if (count < THRESHOLDS.STRUCTURING_COUNT) return false;
+
+  const cumulativeSum =
+    recent.reduce((sum, h) => sum + txAmount(h), 0) + (inSmurfRange ? amount : 0);
+
+  return cumulativeSum >= THRESHOLDS.LARGE_TX * THRESHOLDS.STRUCTURING_VOLUME_RATIO;
 }
 
 export function isVelocityExceeded(tx, history = []) {
@@ -170,11 +200,16 @@ export function createStreamAnalyzer() {
         hour: [],
         sum: 0,
         smallCount: 0,
+        smurfSum: 0,
         rapidFlagged: false,
       };
       states.set(senderId, state);
     }
     return state;
+  }
+
+  function inSmurfRange(amount) {
+    return amount >= THRESHOLDS.STRUCTURING_LOWER && amount < THRESHOLDS.LARGE_TX;
   }
 
   function process(tx) {
@@ -184,8 +219,12 @@ export function createStreamAnalyzer() {
     const amount = txAmount(tx);
 
     evictHead(state.day, t - THRESHOLDS.WINDOW_MS, (gone) => {
-      state.sum -= txAmount(gone);
-      if (txAmount(gone) < THRESHOLDS.STRUCTURING) state.smallCount -= 1;
+      const goneAmount = txAmount(gone);
+      state.sum -= goneAmount;
+      if (inSmurfRange(goneAmount)) {
+        state.smallCount -= 1;
+        state.smurfSum -= goneAmount;
+      }
     });
     evictHead(state.hour, t - THRESHOLDS.RAPID_TX_WINDOW_MS);
 
@@ -197,8 +236,15 @@ export function createStreamAnalyzer() {
       pushFlag(flags, 'NEAR_THRESHOLD', 'HIGH', senderId, { txId: tx.id, amount });
     }
 
-    if (amount < THRESHOLDS.STRUCTURING && state.smallCount >= THRESHOLDS.STRUCTURING_COUNT) {
-      pushFlag(flags, 'STRUCTURING', 'HIGH', senderId, { txId: tx.id, amount });
+    if (inSmurfRange(amount)) {
+      const count = state.smallCount + 1;
+      const cumulativeSum = state.smurfSum + amount;
+      if (
+        count >= THRESHOLDS.STRUCTURING_COUNT &&
+        cumulativeSum >= THRESHOLDS.LARGE_TX * THRESHOLDS.STRUCTURING_VOLUME_RATIO
+      ) {
+        pushFlag(flags, 'STRUCTURING', 'HIGH', senderId, { txId: tx.id, amount });
+      }
     }
 
     if (state.sum + amount > THRESHOLDS.VELOCITY_LIMIT) {
@@ -216,7 +262,10 @@ export function createStreamAnalyzer() {
     state.day.push(tx);
     state.hour.push(tx);
     state.sum += amount;
-    if (amount < THRESHOLDS.STRUCTURING) state.smallCount += 1;
+    if (inSmurfRange(amount)) {
+      state.smallCount += 1;
+      state.smurfSum += amount;
+    }
   }
 
   return {
@@ -246,7 +295,7 @@ export const PRE_SUBMISSION_RULES = [
   },
   {
     id: 'STRUCTURING',
-    description: `More than ${THRESHOLDS.STRUCTURING_COUNT} transactions below $${THRESHOLDS.STRUCTURING} in 24h (structuring)`,
+    description: `≥ ${THRESHOLDS.STRUCTURING_COUNT} transactions in [$${THRESHOLDS.STRUCTURING_LOWER}, $${THRESHOLDS.LARGE_TX}) in 24h aggregating near $${THRESHOLDS.LARGE_TX} (structuring)`,
     severity: 'HIGH',
     check: (tx, history) => isStructuring(tx, history),
   },
@@ -258,17 +307,8 @@ export const PRE_SUBMISSION_RULES = [
   },
   {
     id: 'RAPID_SUCCESSION',
-    description: `${THRESHOLDS.RAPID_TX_COUNT}+ transactions within ${THRESHOLDS.RAPID_TX_WINDOW_MS / 60000} minutes`,
+    description: `≥ ${THRESHOLDS.RAPID_TX_COUNT} transactions within ${THRESHOLDS.RAPID_TX_WINDOW_MS / HOUR_MS}h`,
     severity: 'MEDIUM',
     check: (tx, history) => isRapidSuccession(tx, history),
-  },
-];
-
-export const POST_SUBMISSION_ONLY_RULES = [
-  {
-    id: 'NEAR_THRESHOLD',
-    description: `Single transaction just below the $${THRESHOLDS.LARGE_TX} reporting threshold`,
-    severity: 'HIGH',
-    check: (tx) => isNearThreshold(tx),
   },
 ];
