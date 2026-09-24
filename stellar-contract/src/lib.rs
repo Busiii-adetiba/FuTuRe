@@ -48,6 +48,12 @@ const MIN_DISPUTE_BOND: i128 = PRECISION;
 /// abort the whole transaction.
 pub const MAX_BATCH_REDEEM_SIZE: u32 = 20;
 
+/// Minimum time between `oracle_report` and `finalize`, during which the
+/// reported outcome can be disputed.
+pub const DISPUTE_WINDOW_SECONDS: u64 = 86_400;
+/// Fixed-point scale for `fee_per_share_accumulated`.
+const FEE_PRECISION: i128 = 1_000_000_000_000;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -87,6 +93,10 @@ pub struct Market {
     /// Total LP shares outstanding. Tracked separately from `lp_pool`
     /// so that the share/value ratio can diverge as trading changes pool value.
     pub total_lp_shares: i128,
+    /// Ledger timestamp at which the oracle reported the outcome.
+    pub reported_at: Option<u64>,
+    /// Cumulative LP fees per LP share, scaled by `FEE_PRECISION`.
+    pub fee_per_share_accumulated: i128,
     /// Ledger timestamp after which trading stops and the oracle may report.
     pub close_time: u64,
     /// Ledger timestamp after which an unreported market can be cancelled by anyone.
@@ -100,6 +110,8 @@ pub struct Position {
     pub no_shares: i128,
     pub lp_shares: i128,
     pub split_tokens: i128,
+    /// Snapshot of `fee_per_share_accumulated` at the last fee settlement.
+    pub last_fee_per_share: i128,
 }
 
 #[contracttype]
@@ -263,6 +275,8 @@ impl PredictionMarket {
             disputer: None,
             oracle: Some(oracle.clone()),
             total_lp_shares: 0,
+            reported_at: None,
+            fee_per_share_accumulated: 0,
             close_time,
             resolution_deadline,
         };
@@ -279,6 +293,7 @@ impl PredictionMarket {
     pub fn seed_market(env: Env, caller: Address, market_id: u32, amount: i128) -> Result<(), Error> {
         caller.require_auth();
         Self::require_not_paused(&env)?;
+        Self::require_positive(amount)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
         Self::require_trading_open(&env, &market)?;
@@ -329,6 +344,7 @@ impl PredictionMarket {
             return Err(Error::MarketNotExpired);
         }
         market.outcome = Some(outcome);
+        market.reported_at = Some(env.ledger().timestamp());
         // Status stays Closed; finalize moves it to Resolved after dispute window
         Self::save_market(&env, market_id, &market);
         Self::emit(&env, symbol_short!("reported"), (market_id, caller, outcome));
@@ -351,6 +367,7 @@ impl PredictionMarket {
         if market.outcome.is_none() {
             return Err(Error::InvalidOutcome);
         }
+        Self::require_positive(bond)?;
         // Escrow the bond into the contract before flipping status, so a
         // failed/insufficient transfer aborts the whole call instead of
         // leaving a market marked Disputed with no collateral behind it.
@@ -381,10 +398,19 @@ impl PredictionMarket {
         Self::require_admin(&env, &caller)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Disputed)?;
+        // The disputer was right: return 100% of their bond.
+        let disputer = market.disputer.clone().ok_or(Error::Unauthorized)?;
+        let refund = market.dispute_bond;
+        let key = Self::bond_refund_key(&disputer);
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(current + refund));
+        market.dispute_bond = 0;
+        market.disputer = None;
         market.outcome = Some(new_outcome);
         market.status = MarketStatus::EmergencyResolved;
         Self::save_market(&env, market_id, &market);
         Self::emit(&env, symbol_short!("upheld"), (market_id, caller, new_outcome));
+        Self::emit(&env, symbol_short!("bond_ref"), (market_id, disputer, refund));
         Ok(())
     }
 
@@ -423,6 +449,14 @@ impl PredictionMarket {
         }
         if market.outcome.is_none() {
             return Err(Error::InvalidOutcome);
+        }
+        // EmergencyResolved markets were already adjudicated by the admin and
+        // bypass the remaining dispute window.
+        if market.status == MarketStatus::Closed {
+            let reported_at = market.reported_at.ok_or(Error::InvalidOutcome)?;
+            if env.ledger().timestamp() < reported_at.saturating_add(DISPUTE_WINDOW_SECONDS) {
+                return Err(Error::DisputeWindowOpen);
+            }
         }
         market.status = MarketStatus::Resolved;
         Self::save_market(&env, market_id, &market);
@@ -478,6 +512,8 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_positive(amount)?;
+        let shares = Self::calc_shares(amount, market.yes_pool, market.no_pool)?;
         Self::require_trading_open(&env, &market)?;
         Self::require_positive(amount)?;
         let shares = Self::calc_shares(amount, market.yes_pool, market.no_pool);
@@ -520,6 +556,8 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_positive(amount)?;
+        let shares = Self::calc_shares(amount, market.no_pool, market.yes_pool)?;
         Self::require_trading_open(&env, &market)?;
         Self::require_positive(amount)?;
         let shares = Self::calc_shares(amount, market.no_pool, market.yes_pool);
@@ -813,6 +851,7 @@ impl PredictionMarket {
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_positive(amount)?;
         Self::require_trading_open(&env, &market)?;
         Self::require_positive(amount)?;
         Self::transfer_in(&env, &provider, amount)?;
@@ -837,6 +876,14 @@ impl PredictionMarket {
         market.no_pool += amount / 2;
         Self::save_market(env, market_id, &market);
 
+        if lp_shares <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Settle pending fees on existing shares and checkpoint so the new
+        // shares cannot claim historical fees.
+        let mut pos = Self::load_position(&env, market_id, &provider);
+        Self::settle_lp_fees(&env, market_id, &provider, &market, &mut pos);
         let mut pos = Self::load_position(env, market_id, provider);
         pos.lp_shares += lp_shares;
         Self::save_position(env, market_id, provider, &pos);
@@ -863,11 +910,15 @@ impl PredictionMarket {
         lp_shares: i128,
     ) -> Result<i128, Error> {
         Self::require_not_paused(&env)?;
+        let mut market = Self::load_market(&env, market_id)?;
+        Self::require_positive(lp_shares)?;
+        let mut pos = Self::load_position(&env, market_id, &provider);
         let mut market = Self::load_market(env, market_id)?;
         let mut pos = Self::load_position(env, market_id, provider);
         if pos.lp_shares < lp_shares {
             return Err(Error::InsufficientFunds);
         }
+        Self::settle_lp_fees(&env, market_id, &provider, &market, &mut pos);
 
         // Payout = redeemed_shares * current_pool_value / total_shares_outstanding.
         // This means an LP that deposited when the pool was large and trading has
@@ -923,20 +974,40 @@ impl PredictionMarket {
         provider.require_auth();
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
-        let pos = Self::load_position(&env, market_id, &provider);
-        if pos.lp_shares == 0 {
+        let mut pos = Self::load_position(&env, market_id, &provider);
+        if pos.lp_shares == 0 && Self::pending_lp_fees(&env, market_id, &provider) == 0 {
             return Err(Error::NothingToRedeem);
         }
-        // Fee share = provider_lp_shares / total_lp_shares_outstanding * accumulated_fees.
-        // Use total_lp_shares (share units) not lp_pool (asset units) as the denominator
-        // so that the fee split is proportional to ownership, not to deposit size.
-        let total_lp = market.total_lp_shares.max(1);
-        let fee_share = (pos.lp_shares * market.lp_fees) / total_lp;
+        // Accumulator accounting: each LP is paid
+        // lp_shares * (fee_per_share_accumulated - last_fee_per_share) / PRECISION
+        // plus any fees settled on earlier add/remove, so payouts are
+        // independent of claim order and cannot be claimed twice.
+        Self::settle_lp_fees(&env, market_id, &provider, &market, &mut pos);
+        let key = Self::pending_fee_key(market_id, &provider);
+        let fee_share: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().remove(&key);
         market.lp_fees -= fee_share;
         Self::save_market(&env, market_id, &market);
+        Self::save_position(&env, market_id, &provider, &pos);
         Self::transfer_out(&env, &provider, fee_share)?;
         Self::emit_liquidity(&env, symbol_short!("claimed"), (market_id, provider, fee_share));
         Ok(fee_share)
+    }
+
+    /// Credit trading fees to the market's LPs. Admin-only until trading
+    /// functions charge fees directly; they should route through `accrue_lp_fees`.
+    pub fn add_lp_fees(env: Env, caller: Address, market_id: u32, amount: i128) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+        Self::require_positive(amount)?;
+        let mut market = Self::load_market(&env, market_id)?;
+        if market.total_lp_shares <= 0 {
+            return Err(Error::NothingToRedeem);
+        }
+        Self::accrue_lp_fees(&mut market, amount);
+        Self::save_market(&env, market_id, &market);
+        Self::emit_liquidity(&env, symbol_short!("fees"), (market_id, amount));
+        Ok(())
     }
 
     // ── Split / Merge ────────────────────────────────────────────────────────
@@ -983,6 +1054,7 @@ impl PredictionMarket {
         }
         let market = Self::load_market(&env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
+        Self::require_positive(amount)?;
         let mut pos = Self::load_position(&env, market_id, &caller);
         if pos.yes_shares < amount || pos.no_shares < amount {
             return Err(Error::InsufficientFunds);
@@ -1007,6 +1079,11 @@ impl PredictionMarket {
 
     pub fn get_position(env: Env, market_id: u32, user: Address) -> Position {
         Self::load_position(&env, market_id, &user)
+    }
+
+    /// Dispute bond refunded to `disputer` after upheld disputes.
+    pub fn get_bond_refund(env: Env, disputer: Address) -> i128 {
+        env.storage().persistent().get(&Self::bond_refund_key(&disputer)).unwrap_or(0)
     }
 
     pub fn get_treasury_balance(env: Env) -> i128 {
@@ -1126,9 +1203,47 @@ impl PredictionMarket {
     fn calc_shares(amount: i128, own_pool: i128, other_pool: i128) -> i128 {
     fn calc_shares(amount: i128, own_pool: i128, other_pool: i128) -> Result<i128, Error> {
         // Simple CPMM: shares = amount * other_pool / (own_pool + amount)
+        if amount <= 0 || own_pool < 0 || other_pool < 0 {
+            return Err(Error::InvalidAmount);
+        }
         if own_pool == 0 && other_pool == 0 {
             return Ok(amount);
         }
+        // amount > 0 and own_pool >= 0, so denom is strictly positive.
+        let denom = own_pool + amount;
+        Ok((amount * (other_pool + own_pool)) / denom)
+    }
+
+    fn accrue_lp_fees(market: &mut Market, fee: i128) {
+        market.lp_fees += fee;
+        market.fee_per_share_accumulated += (fee * FEE_PRECISION) / market.total_lp_shares;
+    }
+
+    /// Move fees accrued on `pos.lp_shares` since its last checkpoint into the
+    /// provider's pending balance and advance the checkpoint.
+    fn settle_lp_fees(env: &Env, market_id: u32, provider: &Address, market: &Market, pos: &mut Position) {
+        let delta = market.fee_per_share_accumulated - pos.last_fee_per_share;
+        if pos.lp_shares > 0 && delta > 0 {
+            let owed = (pos.lp_shares * delta) / FEE_PRECISION;
+            if owed > 0 {
+                let key = Self::pending_fee_key(market_id, provider);
+                let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+                env.storage().persistent().set(&key, &(current + owed));
+            }
+        }
+        pos.last_fee_per_share = market.fee_per_share_accumulated;
+    }
+
+    fn pending_lp_fees(env: &Env, market_id: u32, provider: &Address) -> i128 {
+        env.storage().persistent().get(&Self::pending_fee_key(market_id, provider)).unwrap_or(0)
+    }
+
+    fn pending_fee_key(market_id: u32, provider: &Address) -> (Symbol, u32, Address) {
+        (symbol_short!("LPFEE"), market_id, provider.clone())
+    }
+
+    fn bond_refund_key(disputer: &Address) -> (Symbol, Address) {
+        (symbol_short!("BOND_REF"), disputer.clone())
         let denom = Self::checked_add(own_pool, amount)?;
         if denom == 0 {
             return Ok(0);
@@ -1164,6 +1279,13 @@ impl PredictionMarket {
 
     fn load_position(env: &Env, market_id: u32, user: &Address) -> Position {
         let key = (symbol_short!("POS"), market_id, user.clone());
+        env.storage().persistent().get(&key).unwrap_or(Position {
+            yes_shares: 0,
+            no_shares: 0,
+            lp_shares: 0,
+            split_tokens: 0,
+            last_fee_per_share: 0,
+        })
         match env.storage().persistent().get(&key) {
             Some(pos) => {
                 Self::extend_persistent(env, &key);
