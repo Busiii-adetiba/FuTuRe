@@ -1,6 +1,6 @@
 import logger from './config/logger.js';
 import { processActiveStreams } from './services/streaming.js';
-import { expireStaleTransactions } from './services/multiSig.js';
+import { cleanupExpiredMultiSigTransactions } from './services/multiSig.js';
 import { startScheduler as startBackupScheduler } from './backup/manager.js';
 import { sendScheduledDigests } from './services/digestGenerator.js';
 import { checkAllUserBalances } from './services/lowBalanceMonitor.js';
@@ -22,10 +22,12 @@ export async function startScheduler() {
   }, 60 * 1000);
   intervals.push(streamingInterval);
 
-  // Multi-sig expiry worker - check every minute
+  // Multi-sig expiry cleanup (#1287) - transition abandoned pending
+  // transactions to 'expired'. Runs every minute (tighter than the 10-minute
+  // minimum) since pending envelopes only live for 5 minutes.
   const multiSigInterval = setInterval(async () => {
     try {
-      const count = await expireStaleTransactions();
+      const count = await cleanupExpiredMultiSigTransactions();
       if (count > 0) logger.info('scheduler.multisig.expired', { count });
     } catch (err) {
       logger.error('scheduler.multisig.failed', { error: err.message });
