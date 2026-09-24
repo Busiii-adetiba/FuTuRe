@@ -17,6 +17,8 @@
 
 import logger from '../config/logger.js';
 import prisma from '../db/client.js';
+import { authenticateWithAnchor, validateSep31AnchorDomain } from './sep10.js';
+import { assertDnsPin, validatePublicHttpsUrl } from '../utils/ssrfValidator.js';
 
 const FETCH_TIMEOUT_MS = 10000;
 const TERMINAL_SEP31_STATUSES = new Set(['completed', 'error', 'expired', 'rejected']);
@@ -120,14 +122,10 @@ export function calculateNextSep31PollAt(row, transaction, now = new Date()) {
  * @returns {Promise<{ domain: string, directPaymentServer: string }>}
  */
 export async function discoverReceivingAnchor(domain) {
-  const cleanDomain = normalizeDomain(domain);
-  if (!cleanDomain) {
-    const err = new Error('domain is required');
-    err.status = 400;
-    throw err;
-  }
+  const { hostname: cleanDomain, dnsPin } = await validateSep31AnchorDomain(domain);
 
   const tomlUrl = `https://${cleanDomain}/.well-known/stellar.toml`;
+  await assertDnsPin(dnsPin);
   const response = await fetchWithTimeout(tomlUrl);
   if (!response.ok) {
     const err = new Error(`${cleanDomain} returned ${response.status} fetching stellar.toml`);
@@ -154,7 +152,10 @@ export async function discoverReceivingAnchor(domain) {
  * @returns {Promise<object>} The anchor's /info response body.
  */
 export async function getAnchorInfo(anchorUrl) {
-  const url = `${trimTrailingSlash(anchorUrl)}/info`;
+  const cleanAnchorUrl = trimTrailingSlash(anchorUrl);
+  const { dnsPin } = await validatePublicHttpsUrl(cleanAnchorUrl, { allowPath: true, allowQuery: true });
+  const url = `${cleanAnchorUrl}/info`;
+  await assertDnsPin(dnsPin);
   const response = await fetchWithTimeout(url);
   if (!response.ok) {
     const err = new Error(`Anchor ${anchorUrl} returned ${response.status} from GET /info`);
@@ -182,11 +183,14 @@ export async function createCrossBorderTransaction(anchorUrl, params, { authToke
   }
 
   const cleanAnchorUrl = trimTrailingSlash(anchorUrl);
+  const { dnsPin } = await validatePublicHttpsUrl(cleanAnchorUrl, { allowPath: true, allowQuery: true });
+  const resolvedAuthToken = authToken || (await authenticateWithAnchor(cleanAnchorUrl));
+  await assertDnsPin(dnsPin);
   const response = await fetchWithTimeout(`${cleanAnchorUrl}/transactions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      ...(resolvedAuthToken ? { Authorization: `Bearer ${resolvedAuthToken}` } : {}),
     },
     body: JSON.stringify(params),
   });
@@ -251,8 +255,11 @@ export async function getTransactionStatus(anchorUrl, id, { authToken } = {}) {
   }
 
   const cleanAnchorUrl = trimTrailingSlash(anchorUrl);
+  const { dnsPin } = await validatePublicHttpsUrl(cleanAnchorUrl, { allowPath: true, allowQuery: true });
+  const resolvedAuthToken = authToken || (await authenticateWithAnchor(cleanAnchorUrl));
+  await assertDnsPin(dnsPin);
   const response = await fetchWithTimeout(`${cleanAnchorUrl}/transactions/${encodeURIComponent(id)}`, {
-    headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+    headers: resolvedAuthToken ? { Authorization: `Bearer ${resolvedAuthToken}` } : {},
   });
 
   if (!response.ok) {

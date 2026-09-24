@@ -559,6 +559,21 @@ model Sep31Transaction {
   @@index([pollingActive, nextPollAt])
 }
 
+// Unique accounts that have received fee-bump sponsorship at least once.
+model FeeBumpAccount {
+  publicKey   String   @id
+  firstUsedAt DateTime @default(now())
+}
+
+// Date-partitioned aggregate counters for fee-bump activity.
+model FeeBumpSummary {
+  date            DateTime @id @db.Date
+  total           Int      @default(0)
+  totalFeeStroops BigInt   @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
 
 // Real Horizon fee-stats snapshots persisted by the scheduler every 5 minutes.
 // getFeeHistory() queries this table instead of generating synthetic data.
@@ -737,4 +752,79 @@ model ComplianceReport {
   @@index([reportType])
   @@index([filingStatus])
   @@index([generatedAt])
+}
+
+// ─── Multi-Sig Pending Transactions (#1287) ──────────────────────────────────
+
+// Envelopes awaiting signatures from multiple signers. Rows past expiresAt are
+// transitioned to status 'expired' by the scheduler so active listings only
+// return executable transactions.
+model PendingMultiSigTx {
+  txId            String   @id
+  txXdr           String
+  sourcePublicKey String
+  destination     String
+  amount          String
+  assetCode       String   @default("XLM")
+  signatures      Json     @default("[]")
+  status          String   @default("pending") // pending | submitted | failed | expired
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status, expiresAt])
+  @@index([sourcePublicKey, status])
+}
+
+// ─── AMM Pools (#1290) ───────────────────────────────────────────────────────
+
+// Durable, shared AMM state. Replaces the per-process Maps in services/amm.js
+// so every ECS task sees the same reserves. `version` is an optimistic-lock
+// counter: every reserve mutation is `UPDATE ... WHERE poolId = ? AND version = ?`.
+model AmmPool {
+  poolId    String        @id
+  assetA    String
+  assetB    String
+  reserveA  Decimal       @db.Decimal(38, 18)
+  reserveB  Decimal       @db.Decimal(38, 18)
+  feeBps    Int           @default(30)
+  version   Int           @default(0)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  positions AmmPosition[]
+  trades    AmmTrade[]
+
+  @@index([assetA, assetB])
+}
+
+model AmmPosition {
+  id         String   @id @default(uuid())
+  providerId String
+  poolId     String
+  pool       AmmPool  @relation(fields: [poolId], references: [poolId], onDelete: Cascade)
+  shares     Decimal  @db.Decimal(38, 18)
+  depositedA Decimal  @db.Decimal(38, 18)
+  depositedB Decimal  @db.Decimal(38, 18)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([providerId, poolId])
+  @@index([poolId])
+}
+
+model AmmTrade {
+  tradeId     String   @id
+  poolId      String
+  pool        AmmPool  @relation(fields: [poolId], references: [poolId], onDelete: Cascade)
+  traderId    String
+  inputAsset  String
+  outputAsset String
+  amountIn    Decimal  @db.Decimal(38, 18)
+  amountOut   Decimal  @db.Decimal(38, 18)
+  feePaid     Decimal  @db.Decimal(38, 18)
+  priceImpact Decimal  @db.Decimal(38, 18)
+  createdAt   DateTime @default(now())
+
+  @@index([poolId, createdAt])
+  @@index([traderId])
 }

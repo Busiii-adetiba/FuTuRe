@@ -264,10 +264,32 @@ describe('#954 env.js — signingKey / serverBaseUrl / sorobanRpcUrl config fiel
 describe('#955 services/sep31.js', () => {
   let mockFetch;
   let prisma;
+  let authenticateWithAnchor;
 
   beforeEach(async () => {
     vi.resetModules();
     vi.clearAllMocks();
+    process.env.SEP10_SENDER_SECRET = 'S'.repeat(56);
+    authenticateWithAnchor = vi.fn(() => Promise.resolve('sep10-jwt-token'));
+    vi.doMock('../src/services/sep10.js', () => ({
+      authenticateWithAnchor,
+      validateSep31AnchorDomain: vi.fn((domain) =>
+        Promise.resolve({
+          hostname: String(domain).replace(/^https?:\/\//, '').replace(/\/+$/, ''),
+          dnsPin: { hostname: 'anchor.example', addresses: ['1.1.1.1'] },
+        }),
+      ),
+    }));
+    vi.doMock('../src/utils/ssrfValidator.js', () => ({
+      validatePublicHttpsUrl: vi.fn((url) =>
+        Promise.resolve({
+          parsed: new URL(String(url)),
+          normalizedUrl: String(url),
+          dnsPin: { hostname: 'anchor.example', addresses: ['1.1.1.1'] },
+        }),
+      ),
+      assertDnsPin: vi.fn(() => Promise.resolve()),
+    }));
     mockFetch = vi.fn();
     vi.stubGlobal('fetch', mockFetch);
     prisma = (await import('../src/db/client.js')).default;
@@ -275,6 +297,7 @@ describe('#955 services/sep31.js', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    delete process.env.SEP10_SENDER_SECRET;
   });
 
   function tomlResponse(body, { ok = true, status = 200 } = {}) {
@@ -342,6 +365,13 @@ describe('#955 services/sep31.js', () => {
 
     expect(result.id).toBe('anchor-tx-1');
     expect(result.localRecordId).toBe('local-row-1');
+    expect(authenticateWithAnchor).toHaveBeenCalledWith('https://anchor.example/sep31');
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://anchor.example/sep31/transactions',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer sep10-jwt-token' }),
+      }),
+    );
     expect(prisma.sep31Transaction.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -393,6 +423,10 @@ describe('#955 services/sep31.js', () => {
         pollingActive: false,
         terminalState: true,
       }),
+    expect(authenticateWithAnchor).toHaveBeenCalledWith('https://anchor.example/sep31');
+    expect(prisma.sep31Transaction.updateMany).toHaveBeenCalledWith({
+      where: { anchorUrl: 'https://anchor.example/sep31', externalId: 'anchor-tx-1' },
+      data: { status: 'completed' },
     });
   });
 

@@ -10,6 +10,7 @@ import { getCachedBalance, invalidateBalanceCache } from '../cache/balanceCache.
 import { recordHorizonCall } from '../monitoring/horizonAlerter.js';
 import { withSpan } from '../config/otel.js';
 import { recordFeeSample, getSevenDayAverageFee, detectFeeSurge } from './feeSurge.js';
+import { sequenceManager } from './sequenceManager.js';
 
 const stellarInteractiveBreaker = createCircuitBreaker('Horizon-Interactive');
 
@@ -18,43 +19,56 @@ const stellarInteractiveBreaker = createCircuitBreaker('Horizon-Interactive');
  * @returns {Promise<{total: number, totalFeeStroops: number, uniqueAccounts: number}>}
  */
 export async function getFeeBumpStats() {
-  const row = await prisma.feeBumpStat.findUnique({ where: { id: 'singleton' } });
+  const [summaryAgg, uniqueAccounts] = await Promise.all([
+    prisma.feeBumpSummary.aggregate({
+      _sum: {
+        total: true,
+        totalFeeStroops: true,
+      },
+    }),
+    prisma.feeBumpAccount.count(),
+  ]);
   return {
-    total: row?.total ?? 0,
-    totalFeeStroops: Number(row?.totalFeeStroops ?? 0),
-    uniqueAccounts: Array.isArray(row?.accounts) ? row.accounts.length : 0,
+    total: Number(summaryAgg?._sum?.total ?? 0),
+    totalFeeStroops: Number(summaryAgg?._sum?.totalFeeStroops ?? 0),
+    uniqueAccounts,
   };
 }
 
 async function incrementFeeBumpStats(sourcePublicKey, feeStroops) {
   try {
-    // Upsert the singleton row, then atomically add the new account to the set
-    await prisma.$transaction(async (tx) => {
-      const existing = await tx.feeBumpStat.upsert({
-        where: { id: 'singleton' },
-        create: {
-          id: 'singleton',
-          total: 1,
-          totalFeeStroops: feeStroops,
-          accounts: [sourcePublicKey],
-        },
-        update: {
-          total: { increment: 1 },
-          totalFeeStroops: { increment: feeStroops },
-        },
-      });
-      // Add account to set if not already present
-      const accounts = Array.isArray(existing.accounts) ? existing.accounts : [];
-      if (!accounts.includes(sourcePublicKey)) {
-        await tx.feeBumpStat.update({
-          where: { id: 'singleton' },
-          data: { accounts: [...accounts, sourcePublicKey] },
-        });
-      }
-    });
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+
+    // Account insert is contention-free via ON CONFLICT DO NOTHING.
+    // Daily summary update keeps counters bounded by date instead of one singleton row.
+    await Promise.all([
+      prisma.$executeRaw`
+        INSERT INTO "FeeBumpAccount" ("publicKey", "firstUsedAt")
+        VALUES (${sourcePublicKey}, NOW())
+        ON CONFLICT ("publicKey") DO NOTHING
+      `,
+      prisma.$executeRaw`
+        INSERT INTO "FeeBumpSummary" ("date", "total", "totalFeeStroops", "createdAt", "updatedAt")
+        VALUES (${today}, 1, ${feeStroops}, NOW(), NOW())
+        ON CONFLICT ("date")
+        DO UPDATE SET
+          "total" = "FeeBumpSummary"."total" + 1,
+          "totalFeeStroops" = "FeeBumpSummary"."totalFeeStroops" + ${feeStroops},
+          "updatedAt" = NOW()
+      `,
+    ]);
   } catch (err) {
     logger.warn('stellar.feeBumpStats.persist.failed', { error: err.message });
   }
+}
+
+function isBadSequenceError(err) {
+  const txCode =
+    err?.response?.data?.extras?.result_codes?.transaction ??
+    err?.data?.extras?.result_codes?.transaction;
+  if (txCode === 'tx_bad_seq') return true;
+  return String(err?.message ?? '').includes('tx_bad_seq');
 }
 
 /**
@@ -77,9 +91,36 @@ export function wrapWithFeeBump(innerTx, feeAccountSecret) {
   const networkPassphrase = getNetworkPassphrase();
 
   const multiplier = parseInt(process.env.FEE_BUMP_MULTIPLIER ?? '10', 10);
+  const minFee = parseInt(process.env.MIN_FEE_STROOPS ?? String(StellarSDK.BASE_FEE), 10);
+  const maxFee = parseInt(process.env.MAX_FEE_BUMP_STROOPS ?? process.env.MAX_FEE_STROOPS ?? '100000', 10);
+
+  let surgeFee = 0;
+  try {
+    const avgFee = getSevenDayAverageFee();
+    const surgeInfo = detectFeeSurge(StellarSDK.BASE_FEE * multiplier, avgFee);
+    if (surgeInfo?.surge && avgFee) {
+      surgeFee = Math.round(avgFee * surgeInfo.ratio);
+    }
+  } catch (err) {
+    logger.warn('stellar.wrapWithFeeBump.feeSurgeCheck.failed', { error: err.message });
+  }
+
+  const baseConfiguredFee = StellarSDK.BASE_FEE * multiplier;
+  const calculatedFee = Math.max(surgeFee, baseConfiguredFee, minFee);
+  const finalFee = Math.min(calculatedFee, maxFee);
+
+  logger.info('stellar.wrapWithFeeBump.feeDetermined', {
+    multiplier,
+    baseConfiguredFee,
+    surgeFee,
+    minFee,
+    maxFee,
+    finalFee,
+  });
+
   const feeBumpTx = StellarSDK.TransactionBuilder.buildFeeBumpTransaction(
     feeKeypair,
-    StellarSDK.BASE_FEE * multiplier,
+    finalFee,
     innerTx,
     networkPassphrase,
   );
@@ -136,8 +177,8 @@ const HORIZON_RETRY_BACKOFFS = [500, 1000, 2000];
 
 function isTransientHorizonError(err) {
   const status = err?.response?.status ?? err?.status;
-  if (status === 400 || status === 404 || status === 409) return false;
-  if (status === 429 || status === 503) return true;
+  if (status === 400 || status === 401 || status === 403 || status === 404 || status === 409) return false;
+  if (status === 429 || status === 502 || status === 503 || status === 504 || status === 520 || (status >= 500 && status < 600)) return true;
   if (err.isTimeout) return true;
   const code = err?.code;
   if (
@@ -158,7 +199,7 @@ function isTransientHorizonError(err) {
  * @param {() => Promise<T>} fn
  * @returns {Promise<T>}
  */
-export async function withHorizonRetry(fn) {
+export async function withHorizonRetry(fn, txHash = null) {
   let lastErr;
   for (let attempt = 0; attempt <= HORIZON_RETRY_BACKOFFS.length; attempt++) {
     try {
@@ -171,6 +212,30 @@ export async function withHorizonRetry(fn) {
         recordHorizonCall(true);
         throw err;
       }
+
+      // If we have a transaction hash and encountered a timeout or network drop,
+      // verify if the transaction was already committed on-chain to avoid double submission.
+      if (txHash) {
+        try {
+          const confirmedTx = await getHorizonServer().transactions().transaction(txHash).call();
+          if (confirmedTx && (confirmedTx.successful !== undefined || confirmedTx.id || confirmedTx.hash)) {
+            logger.info('stellar.horizon.retry.alreadyCommitted', { txHash, ledger: confirmedTx.ledger_attr ?? confirmedTx.ledger });
+            recordHorizonCall(false);
+            return {
+              ...confirmedTx,
+              hash: confirmedTx.hash || txHash,
+              ledger: confirmedTx.ledger_attr ?? confirmedTx.ledger,
+              successful: confirmedTx.successful ?? true,
+            };
+          }
+        } catch (checkErr) {
+          // If 404, tx is not on-chain yet; proceed with retry. Otherwise log warning and proceed.
+          if (checkErr?.response?.status !== 404) {
+            logger.warn('stellar.horizon.retry.hashCheckFailed', { txHash, error: checkErr.message });
+          }
+        }
+      }
+
       const delay = HORIZON_RETRY_BACKOFFS[attempt];
       logger.warn('stellar.horizon.retry', { attempt: attempt + 1, delay, error: err.message });
       await new Promise((r) => setTimeout(r, delay));
@@ -441,17 +506,6 @@ export async function sendPayment(
     correlationId: txCorrelationId,
   });
 
-  // Sequence Numbers
-  // loadAccount fetches the current on-chain sequence number for the source account.
-  // Every Stellar transaction must include a sequence number exactly one greater than
-  // the account's last committed transaction. This guarantees transactions execute in
-  // the intended order and prevents replay attacks (an old signed transaction cannot
-  // be resubmitted once the sequence number has advanced).
-  // @see https://developers.stellar.org/docs/learn/fundamentals/transactions/signals#sequence-number
-  const sourceAccount = await withHorizonRetry(() =>
-    getHorizonServer().loadAccount(sourcePublicKey),
-  );
-
   if (assetCode !== 'XLM' && !getIssuer(assetCode)) {
     throw new Error('ASSET_ISSUER is required for non-XLM payments');
   }
@@ -499,32 +553,113 @@ export async function sendPayment(
   // Fee bump: wrap if buyer XLM balance is below threshold and platform key is configured
   const platformFeeSecret = process.env.PLATFORM_FEE_ACCOUNT_SECRET;
   const feeBumpThreshold = parseFloat(process.env.FEE_BUMP_THRESHOLD_XLM ?? '2');
-  let txToSubmit = transaction;
-  let usedFeeBump = false;
 
-  if (platformFeeSecret) {
-    const xlmBalance = sourceAccount.balances.find((b) => b.asset_type === 'native');
-    const xlmAmount = parseFloat(xlmBalance?.balance ?? '0');
-    if (xlmAmount < feeBumpThreshold) {
-      txToSubmit = wrapWithFeeBump(transaction, platformFeeSecret);
-      usedFeeBump = true;
-      logger.info('stellar.feeBump.applied', {
+  let result;
+  let usedFeeBump = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const sequenceResult = await sequenceManager.withLock(sourcePublicKey, async () => {
+        const { account: sourceAccount, balances: sourceBalances } =
+          await sequenceManager.getAccountForBuild(sourcePublicKey, () =>
+            withHorizonRetry(() => getHorizonServer().loadAccount(sourcePublicKey)),
+          );
+
+        const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
+          fee: StellarSDK.BASE_FEE,
+          networkPassphrase: isTestnet() ? StellarSDK.Networks.TESTNET : StellarSDK.Networks.PUBLIC,
+        }).addOperation(
+          StellarSDK.Operation.payment({
+            destination,
+            asset,
+            amount: amount.toString(),
+          }),
+        );
+
+        if (memo) {
+          let stellarMemo;
+          switch (memoType) {
+            case 'id':
+              stellarMemo = StellarSDK.Memo.id(memo);
+              break;
+            case 'hash':
+              stellarMemo = StellarSDK.Memo.hash(memo);
+              break;
+            case 'return':
+              stellarMemo = StellarSDK.Memo.return(memo);
+              break;
+            case 'text':
+            default:
+              stellarMemo = StellarSDK.Memo.text(memo);
+              break;
+          }
+          txBuilder.addMemo(stellarMemo);
+        }
+
+        const transaction = txBuilder.setTimeout(30).build();
+        sequenceManager.markBuilt(sourcePublicKey, sourceAccount, sourceBalances);
+        transaction.sign(sourceKeypair);
+
+        let txToSubmit = transaction;
+        let feeBumpApplied = false;
+        if (platformFeeSecret) {
+          const xlmBalance = sourceBalances.find((b) => b.asset_type === 'native');
+          const xlmAmount = parseFloat(xlmBalance?.balance ?? '0');
+          if (xlmAmount < feeBumpThreshold) {
+            txToSubmit = wrapWithFeeBump(transaction, platformFeeSecret);
+            feeBumpApplied = true;
+            logger.info('stellar.feeBump.applied', {
+              source: sourcePublicKey,
+              xlmBalance: xlmAmount,
+              threshold: feeBumpThreshold,
+              correlationId: txCorrelationId,
+            });
+            await incrementFeeBumpStats(
+              sourcePublicKey,
+              StellarSDK.BASE_FEE * parseInt(process.env.FEE_BUMP_MULTIPLIER ?? '10', 10),
+            );
+          }
+        }
+
+        try {
+          const submissionResult = await withHorizonRetry(() =>
+            getHorizonServer().submitTransaction(txToSubmit),
+          );
+          return { submissionResult, feeBumpApplied };
+        } catch (submitErr) {
+          sequenceManager.clear(sourcePublicKey);
+          throw submitErr;
+        }
+      });
+
+      result = sequenceResult.submissionResult;
+      usedFeeBump = sequenceResult.feeBumpApplied;
+      break;
+    } catch (err) {
+      if (attempt === 0 && isBadSequenceError(err)) {
+        sequenceManager.clear(sourcePublicKey);
+        logger.warn('stellar.sendPayment.badSequenceResync', {
+          source: sourcePublicKey,
+          correlationId: txCorrelationId,
+          error: err.message,
+        });
+        continue;
+      }
+      logger.error('stellar.sendPayment.failed', {
         source: sourcePublicKey,
-        xlmBalance: xlmAmount,
-        threshold: feeBumpThreshold,
+        destination,
+        amount,
+        assetCode,
+        error: err.message,
         correlationId: txCorrelationId,
       });
-      // Track stats for cost monitoring
-      await incrementFeeBumpStats(
-        sourcePublicKey,
-        StellarSDK.BASE_FEE * parseInt(process.env.FEE_BUMP_MULTIPLIER ?? '10', 10),
-      );
+      throw err;
     }
   }
 
   let result;
+  const txHash = typeof txToSubmit?.hash === 'function' ? txToSubmit.hash().toString('hex') : null;
   try {
-    result = await withHorizonRetry(() => getHorizonServer().submitTransaction(txToSubmit));
+    result = await withHorizonRetry(() => getHorizonServer().submitTransaction(txToSubmit), txHash);
   } catch (err) {
     logger.error('stellar.sendPayment.failed', {
       source: sourcePublicKey,
@@ -550,7 +685,25 @@ export async function sendPayment(
     correlationId: txCorrelationId,
   });
 
-  await invalidateBalanceCache(sourcePublicKey);
+  await Promise.all([
+    invalidateBalanceCache(sourcePublicKey),
+    invalidateBalanceCache(destination),
+  ]);
+
+  try {
+    const { broadcastToAccount } = await import('./websocket.js');
+    broadcastToAccount(destination, {
+      type: 'balance_update',
+      action: 'payment_received',
+      source: sourcePublicKey,
+      destination,
+      amount,
+      assetCode: assetCode || 'XLM',
+      hash: result.hash,
+    });
+  } catch (wsErr) {
+    logger.warn('stellar.sendPayment.wsNotification.failed', { destination, error: wsErr.message });
+  }
 
   await eventMonitor.publishEvent(sourcePublicKey, {
     type: 'PaymentSent',

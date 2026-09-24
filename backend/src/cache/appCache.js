@@ -23,7 +23,7 @@ export const TTL = {
 };
 
 // ── Redis L2 ────────────────────────────────────────────────────────────────
-const redisBackend = new RedisBackend(process.env.REDIS_URL || null);
+export const redisBackend = new RedisBackend(process.env.REDIS_URL || null);
 await redisBackend.connect().catch(() => {});
 
 // ── Core cache ──────────────────────────────────────────────────────────────
@@ -36,7 +36,9 @@ export const cache = new MultiLevelCache({
 export const keys = {
   balance: (publicKey) => `balance:${publicKey}`,
   rate: (from, to) => `rate:${from}:${to}`,
-  allRates: () => 'rates:all',
+  // Route-level response cache for GET /rates. The raw rate matrix itself lives
+  // under 'rates:all' (see services/exchangeRate.js).
+  allRates: () => 'rates:all:response',
   feeStats: () => 'fee:stats',
 };
 
