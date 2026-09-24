@@ -552,6 +552,21 @@ model Sep31Transaction {
   @@index([status])
 }
 
+// Unique accounts that have received fee-bump sponsorship at least once.
+model FeeBumpAccount {
+  publicKey   String   @id
+  firstUsedAt DateTime @default(now())
+}
+
+// Date-partitioned aggregate counters for fee-bump activity.
+model FeeBumpSummary {
+  date            DateTime @id @db.Date
+  total           Int      @default(0)
+  totalFeeStroops BigInt   @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
 
 // Real Horizon fee-stats snapshots persisted by the scheduler every 5 minutes.
 // getFeeHistory() queries this table instead of generating synthetic data.
