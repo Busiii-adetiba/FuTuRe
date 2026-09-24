@@ -8,6 +8,7 @@ import { processDueWebhookDeliveries } from './webhooks/dispatcher.js';
 import { recordFeeSnapshot, purgeStaleFeeSnapshots } from './services/feeHistory.js';
 import { processSep31StatusPolls } from './services/sep31.js';
 import { refreshAllRates, RATE_REFRESH_INTERVAL_MS } from './services/exchangeRate.js';
+import { drainAmlAlertDlq } from './compliance/amlMonitor.js';
 
 let intervals = [];
 
@@ -143,6 +144,18 @@ export async function startScheduler() {
     }
   }, 24 * 60 * 60 * 1000); // Every 24 hours
   intervals.push(feeSnapshotPurgeInterval);
+
+  // AML alert DLQ retry worker (#1329) - drain failed alert records from the
+  // Redis DLQ back into PostgreSQL once database connectivity is restored.
+  const amlDlqInterval = setInterval(async () => {
+    try {
+      const count = await drainAmlAlertDlq();
+      if (count > 0) logger.info('scheduler.amlDlq.drained', { count });
+    } catch (err) {
+      logger.error('scheduler.amlDlq.failed', { error: err.message });
+    }
+  }, 60 * 1000); // Every minute
+  intervals.push(amlDlqInterval);
 }
 
 export function stopScheduler() {

@@ -3,6 +3,7 @@ import riskScorer from './riskScorer.js';
 import complianceAudit from './complianceAudit.js';
 import kycCollector from './kycCollector.js';
 import logger from '../config/logger.js';
+import redis from '../db/redis.js';
 import {
   THRESHOLDS,
   PRE_SUBMISSION_RULES,
@@ -11,6 +12,10 @@ import {
 
 const amlLogger = logger.child({ component: 'aml' });
 const WINDOW_MS = THRESHOLDS.WINDOW_MS;
+
+// Durable Dead Letter Queue for AML alerts that fail to persist to the database.
+// BSA/AML regulations require complete, durable retention of all monitoring alerts.
+const ALERT_DLQ_KEY = 'compliance:dlq:alerts';
 
 // Post-submission rules for monitoring
 const ALL_RULES = [
@@ -74,7 +79,7 @@ class AMLMonitor {
               riskScore:     riskScore.score ?? 0,
               riskLevel:     riskScore.level ?? 'UNKNOWN',
             },
-          }).catch(() => {}) // don't fail the payment if alert persistence fails
+          }).catch(err => this._handleAlertPersistenceFailure(err, alert, tx, riskScore))
         ));
       }
 
@@ -86,6 +91,40 @@ class AMLMonitor {
     }
 
     return { alerts, riskScore, flagged: alerts.length > 0 };
+  }
+
+  // Handle a failed alert persistence: log, emit metric, and durably enqueue to the DLQ.
+  // Never silently drop an AML alert — BSA/AML requires durable retention.
+  async _handleAlertPersistenceFailure(err, alert, tx, riskScore) {
+    amlLogger.error(
+      { err, alert, txId: tx.id, ruleId: alert.ruleId },
+      'compliance.aml_alert.persist_failed'
+    );
+
+    if (typeof amlLogger.increment === 'function') {
+      amlLogger.increment('aml_alert_persistence_failures_total');
+    }
+
+    const record = {
+      transactionId: tx.id,
+      userId:        tx.senderId,
+      ruleId:        alert.ruleId,
+      severity:      alert.severity,
+      description:   alert.description,
+      riskScore:     riskScore.score ?? 0,
+      riskLevel:     riskScore.level ?? 'UNKNOWN',
+      failedAt:      new Date().toISOString(),
+      reason:        err?.message ?? String(err),
+    };
+
+    try {
+      await redis.rpush(ALERT_DLQ_KEY, JSON.stringify(record));
+    } catch (dlqError) {
+      amlLogger.error(
+        { err: dlqError, record },
+        'compliance.aml_alert.dlq_write_failed'
+      );
+    }
   }
 
   // Set account hold for review
