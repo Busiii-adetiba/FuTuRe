@@ -12,6 +12,8 @@ const ADMIN: Symbol = symbol_short!("ADMIN");
 const PAUSED: Symbol = symbol_short!("PAUSED");
 const MKT_CNT: Symbol = symbol_short!("MKT_CNT");
 const TREASURY: Symbol = symbol_short!("TREASURY");
+/// Transient reentrancy lock held while a state-mutating LP/redeem call runs.
+const REENTRY: Symbol = symbol_short!("REENTRY");
 const TOKEN: Symbol = symbol_short!("TOKEN");
 
 // ── State TTL (ledgers; ~5s per ledger → 17_280 ledgers per day) ─────────────
@@ -142,6 +144,7 @@ pub enum Error {
     DisputeWindowOpen = 13,
     NothingToRedeem = 14,
     InvalidAmount = 15,
+    ReentrancyError = 16,
     TradingClosed = 16,
     MarketNotExpired = 17,
     InvalidDeadline = 18,
@@ -552,15 +555,153 @@ impl PredictionMarket {
 
     pub fn redeem(env: Env, redeemer: Address, market_id: u32) -> Result<i128, Error> {
         redeemer.require_auth();
+        Self::enter_reentrancy_guard(&env)?;
+        let result = Self::redeem_inner(&env, &redeemer, market_id);
+        Self::exit_reentrancy_guard(&env);
+        result
+    }
+
+    /// Batch redeem across multiple markets
+    /// Returns per-market success/failure information instead of silently skipping failed markets.
+    pub fn batch_redeem(env: Env, redeemer: Address, market_ids: Vec<u32>) -> Result<BatchRedeemResult, Error> {
+        redeemer.require_auth();
+        Self::enter_reentrancy_guard(&env)?;
+        let result = Self::batch_redeem_inner(&env, &redeemer, market_ids);
+        Self::exit_reentrancy_guard(&env);
+        result
+    }
+
+    // ── LP ───────────────────────────────────────────────────────────────────
+
+    pub fn add_liquidity(
+        env: Env,
+        provider: Address,
+        market_id: u32,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        provider.require_auth();
+        Self::enter_reentrancy_guard(&env)?;
+        let result = Self::add_liquidity_inner(&env, &provider, market_id, amount);
+        Self::exit_reentrancy_guard(&env);
+        result
+    }
+
+    pub fn remove_liquidity(
+        env: Env,
+        provider: Address,
+        market_id: u32,
+        lp_shares: i128,
+    ) -> Result<i128, Error> {
+        provider.require_auth();
+        Self::enter_reentrancy_guard(&env)?;
+        let result = Self::remove_liquidity_inner(&env, &provider, market_id, lp_shares);
+        Self::exit_reentrancy_guard(&env);
+        result
+    }
+
+    pub fn claim_lp_fees(
+        env: Env,
+        provider: Address,
+        market_id: u32,
+    ) -> Result<i128, Error> {
+        provider.require_auth();
         Self::require_not_paused(&env)?;
         let mut market = Self::load_market(&env, market_id)?;
+        let pos = Self::load_position(&env, market_id, &provider);
+        if pos.lp_shares == 0 {
+            return Err(Error::NothingToRedeem);
+        }
+        // Fee share = provider_lp_shares / total_lp_shares_outstanding * accumulated_fees.
+        // Use total_lp_shares (share units) not lp_pool (asset units) as the denominator
+        // so that the fee split is proportional to ownership, not to deposit size.
+        let total_lp = market.total_lp_shares.max(1);
+        let fee_share = (pos.lp_shares * market.lp_fees) / total_lp;
+        market.lp_fees -= fee_share;
+        Self::save_market(&env, market_id, &market);
+        Self::emit_liquidity(&env, symbol_short!("claimed"), (market_id, provider, fee_share));
+        Ok(fee_share)
+    }
+
+    // ── Split / Merge ────────────────────────────────────────────────────────
+
+    pub fn split(
+        env: Env,
+        caller: Address,
+        market_id: u32,
+        amount: i128,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+        let market = Self::load_market(&env, market_id)?;
+        Self::require_status(&market, &MarketStatus::Open)?;
+        let mut pos = Self::load_position(&env, market_id, &caller);
+        pos.yes_shares += amount;
+        pos.no_shares += amount;
+        pos.split_tokens += amount;
+        Self::save_position(&env, market_id, &caller, &pos);
+        Self::emit(&env, symbol_short!("split"), (market_id, caller, amount));
+        Ok(())
+    }
+
+    pub fn merge(
+        env: Env,
+        caller: Address,
+        market_id: u32,
+        amount: i128,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+        let market = Self::load_market(&env, market_id)?;
+        Self::require_status(&market, &MarketStatus::Open)?;
+        let mut pos = Self::load_position(&env, market_id, &caller);
+        if pos.yes_shares < amount || pos.no_shares < amount {
+            return Err(Error::InsufficientFunds);
+        }
+        pos.yes_shares -= amount;
+        pos.no_shares -= amount;
+        pos.split_tokens -= amount.min(pos.split_tokens);
+        Self::save_position(&env, market_id, &caller, &pos);
+        Self::emit(&env, symbol_short!("merged"), (market_id, caller, amount));
+        Ok(())
+    }
+
+    // ── Views ────────────────────────────────────────────────────────────────
+
+    pub fn get_market(env: Env, market_id: u32) -> Result<Market, Error> {
+        Self::load_market(&env, market_id)
+    }
+
+    pub fn get_position(env: Env, market_id: u32, user: Address) -> Position {
+        Self::load_position(&env, market_id, &user)
+    }
+
+    pub fn get_treasury_balance(env: Env) -> i128 {
+        let key = Self::treasury_key(&env);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    // ── Events ───────────────────────────────────────────────────────────────
+    //
+    // Every state-mutating function above publishes an on-chain event via one
+    // of these helpers so off-chain indexers can subscribe to contract
+    // activity instead of re-scanning storage. Topics follow a
+    // `(category, action)` scheme; see `stellar-contract/README.md` for the
+    // full topic/payload table.
+
+    /// Publish an event under the `("market", action)` topic.
+    // ── Guarded internals (Checks-Effects-Interactions) ──────────────────────
+
+    fn redeem_inner(env: &Env, redeemer: &Address, market_id: u32) -> Result<i128, Error> {
+        Self::require_not_paused(&env)?;
+        let market = Self::load_market(env, market_id)?;
+        let mut market = Self::load_market(&env, market_id)?;
         if market.status == MarketStatus::Cancelled {
-            return Self::refund_cancelled(&env, &redeemer, market_id, &market);
+            return Self::refund_cancelled(env, redeemer, market_id, &market);
         }
         if market.status != MarketStatus::Resolved && market.status != MarketStatus::EmergencyResolved {
             return Err(Error::MarketNotResolved);
         }
-        let mut pos = Self::load_position(&env, market_id, &redeemer);
+        let mut pos = Self::load_position(env, market_id, redeemer);
         let winning_shares = match market.outcome {
             Some(true) => pos.yes_shares,
             Some(false) => pos.no_shares,
@@ -603,12 +744,23 @@ impl PredictionMarket {
         } else {
             0
         };
-        // Clear position
+        // Effects: clear the position and commit it to storage before any
+        // interaction (event emission / future token transfer) so that a
+        // re-entrant call observes zero winning shares (CEI pattern).
         if market.outcome == Some(true) {
             pos.yes_shares = 0;
         } else {
             pos.no_shares = 0;
         }
+        Self::save_position(env, market_id, redeemer, &pos);
+        // Interactions
+        Self::emit(env, symbol_short!("redeemed"), (market_id, redeemer.clone(), payout));
+        Ok(payout)
+    }
+
+    fn batch_redeem_inner(env: &Env, redeemer: &Address, market_ids: Vec<u32>) -> Result<BatchRedeemResult, Error> {
+        let mut successes: Vec<RedeemOutcome> = Vec::new(env);
+        let mut failures: Vec<RedeemFailure> = Vec::new(env);
         Self::save_market(&env, market_id, &market);
         Self::save_position(&env, market_id, &redeemer, &pos);
         Self::transfer_out(&env, &redeemer, payout)?;
@@ -628,7 +780,7 @@ impl PredictionMarket {
         let mut total_payout: i128 = 0;
 
         for id in market_ids.iter() {
-            match Self::redeem(env.clone(), redeemer.clone(), id) {
+            match Self::redeem_inner(env, redeemer, id) {
                 Ok(payout) => {
                     total_payout += payout;
                     successes.push_back(RedeemOutcome {
@@ -652,17 +804,14 @@ impl PredictionMarket {
         })
     }
 
-    // ── LP ───────────────────────────────────────────────────────────────────
-
-    pub fn add_liquidity(
-        env: Env,
-        provider: Address,
+    fn add_liquidity_inner(
+        env: &Env,
+        provider: &Address,
         market_id: u32,
         amount: i128,
     ) -> Result<i128, Error> {
-        provider.require_auth();
         Self::require_not_paused(&env)?;
-        let mut market = Self::load_market(&env, market_id)?;
+        let mut market = Self::load_market(env, market_id)?;
         Self::require_status(&market, &MarketStatus::Open)?;
         Self::require_trading_open(&env, &market)?;
         Self::require_positive(amount)?;
@@ -682,6 +831,15 @@ impl PredictionMarket {
                 / market.lp_pool
         };
 
+        market.lp_pool += amount;
+        market.total_lp_shares += lp_shares;
+        market.yes_pool += amount / 2;
+        market.no_pool += amount / 2;
+        Self::save_market(env, market_id, &market);
+
+        let mut pos = Self::load_position(env, market_id, provider);
+        pos.lp_shares += lp_shares;
+        Self::save_position(env, market_id, provider, &pos);
         market.lp_pool = Self::checked_add(market.lp_pool, amount)?;
         market.total_lp_shares = Self::checked_add(market.total_lp_shares, lp_shares)?;
         market.yes_pool = Self::checked_add(market.yes_pool, amount / 2)?;
@@ -691,23 +849,22 @@ impl PredictionMarket {
         Self::save_market(&env, market_id, &market);
         Self::save_position(&env, market_id, &provider, &pos);
         Self::emit_liquidity(
-            &env,
+            env,
             symbol_short!("added"),
-            (market_id, provider, amount, lp_shares),
+            (market_id, provider.clone(), amount, lp_shares),
         );
         Ok(lp_shares)
     }
 
-    pub fn remove_liquidity(
-        env: Env,
-        provider: Address,
+    fn remove_liquidity_inner(
+        env: &Env,
+        provider: &Address,
         market_id: u32,
         lp_shares: i128,
     ) -> Result<i128, Error> {
-        provider.require_auth();
         Self::require_not_paused(&env)?;
-        let mut market = Self::load_market(&env, market_id)?;
-        let mut pos = Self::load_position(&env, market_id, &provider);
+        let mut market = Self::load_market(env, market_id)?;
+        let mut pos = Self::load_position(env, market_id, provider);
         if pos.lp_shares < lp_shares {
             return Err(Error::InsufficientFunds);
         }
@@ -722,20 +879,42 @@ impl PredictionMarket {
             lp_shares
         };
 
+        // Mirror `add_liquidity`, which credited half of each deposit to both
+        // yes_pool and no_pool: withdraw the same split of the payout so that
+        // `redeem` never pays out phantom liquidity. Clamped so the pools
+        // cannot underflow below zero.
+        let deduct_yes = (payout / 2).min(market.yes_pool).max(0);
+        let deduct_no = (payout / 2).min(market.no_pool).max(0);
+        market.yes_pool -= deduct_yes;
+        market.no_pool -= deduct_no;
         market.lp_pool -= payout;
         market.total_lp_shares -= lp_shares;
         pos.lp_shares -= lp_shares;
+        Self::save_market(env, market_id, &market);
+        Self::save_position(env, market_id, provider, &pos);
         Self::save_market(&env, market_id, &market);
         Self::save_position(&env, market_id, &provider, &pos);
         Self::transfer_out(&env, &provider, payout)?;
         Self::emit_liquidity(
-            &env,
+            env,
             symbol_short!("removed"),
-            (market_id, provider, lp_shares, payout),
+            (market_id, provider.clone(), lp_shares, payout),
         );
         Ok(payout)
     }
 
+    // ── Reentrancy guard ─────────────────────────────────────────────────────
+
+    fn enter_reentrancy_guard(env: &Env) -> Result<(), Error> {
+        if env.storage().instance().get::<_, bool>(&REENTRY).unwrap_or(false) {
+            return Err(Error::ReentrancyError);
+        }
+        env.storage().instance().set(&REENTRY, &true);
+        Ok(())
+    }
+
+    fn exit_reentrancy_guard(env: &Env) {
+        env.storage().instance().remove(&REENTRY);
     pub fn claim_lp_fees(
         env: Env,
         provider: Address,
@@ -844,15 +1023,6 @@ impl PredictionMarket {
         env.storage().instance().get(&TOKEN).ok_or(Error::NotInitialized)
     }
 
-    // ── Events ───────────────────────────────────────────────────────────────
-    //
-    // Every state-mutating function above publishes an on-chain event via one
-    // of these helpers so off-chain indexers can subscribe to contract
-    // activity instead of re-scanning storage. Topics follow a
-    // `(category, action)` scheme; see `stellar-contract/README.md` for the
-    // full topic/payload table.
-
-    /// Publish an event under the `("market", action)` topic.
     fn emit(env: &Env, action: Symbol, data: impl IntoVal<Env, Val>) {
         env.events().publish((symbol_short!("market"), action), data);
     }
