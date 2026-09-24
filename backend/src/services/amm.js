@@ -370,3 +370,119 @@ export function resetAMMState() {
   positions.clear();
   trades.length = 0;
 }
+
+// ── ISSUE-050: Fee-aware arbitrage calculation ────────────────────────────────
+
+/**
+ * Default minimum profitability thresholds for arbitrage opportunities.
+ * Both conditions must be met for `isProfitable` to be `true`.
+ */
+const ARBITRAGE_MIN_PROFIT_USD = 0.50;
+const ARBITRAGE_MIN_ROI_PCT    = 0.2;    // 0.2%
+
+/**
+ * Pool swap fee in basis points (Stellar AMM constant = 30 bps = 0.3%).
+ */
+const POOL_FEE_BPS = 30;
+
+/**
+ * Evaluate an arbitrage opportunity between two pools that trade the same pair,
+ * incorporating all on-chain costs to produce an accurate net-profit figure.
+ *
+ * Costs deducted from gross profit:
+ *   1. AMM pool swap fee: `POOL_FEE_BPS / 10 000` of the input amount (applied
+ *      to each swap leg, so twice for a round-trip arb).
+ *   2. Horizon base fee: `baseFeeStroops * operationsCount` stroops, converted
+ *      to asset value using `xlmExchangeRate`.
+ *
+ * The function also returns `isProfitable` which is `true` only when:
+ *   - `netProfit > ARBITRAGE_MIN_PROFIT_USD`   AND
+ *   - `netProfit / inputAmount > ARBITRAGE_MIN_ROI_PCT / 100`
+ *
+ * @param {object} opts
+ * @param {string}  opts.buyPoolId       - Pool ID to buy from (lower price pool)
+ * @param {string}  opts.sellPoolId      - Pool ID to sell into (higher price pool)
+ * @param {string}  opts.inputAsset      - Asset code to start with
+ * @param {number}  opts.inputAmount     - Amount of `inputAsset` to trade
+ * @param {number}  [opts.baseFeeStroops=100]    - Horizon base fee per operation in stroops
+ * @param {number}  [opts.operationsCount=2]     - Number of on-chain operations (swap legs)
+ * @param {number}  [opts.xlmExchangeRate=0.12]  - XLM price in USD (used to value the network fee)
+ * @param {number}  [opts.minProfitUsd=ARBITRAGE_MIN_PROFIT_USD]   - Minimum net profit threshold in USD
+ * @param {number}  [opts.minRoiPct=ARBITRAGE_MIN_ROI_PCT]         - Minimum ROI threshold (percentage)
+ * @returns {{
+ *   buyPoolId: string,
+ *   sellPoolId: string,
+ *   inputAsset: string,
+ *   inputAmount: number,
+ *   grossProfit: number,
+ *   poolFee: number,
+ *   networkFeeUsd: number,
+ *   totalFees: number,
+ *   netProfit: number,
+ *   roiPct: number,
+ *   isProfitable: boolean,
+ * }}
+ * @throws {Error} If either pool is unknown or `inputAmount` is non-positive
+ */
+export function calculateArbitrage({
+  buyPoolId,
+  sellPoolId,
+  inputAsset,
+  inputAmount,
+  baseFeeStroops = 100,
+  operationsCount = 2,
+  xlmExchangeRate = 0.12,
+  minProfitUsd = ARBITRAGE_MIN_PROFIT_USD,
+  minRoiPct = ARBITRAGE_MIN_ROI_PCT,
+}) {
+  if (!buyPoolId || !sellPoolId || !inputAsset || !inputAmount) {
+    throw new Error('buyPoolId, sellPoolId, inputAsset and inputAmount are required');
+  }
+  if (Number(inputAmount) <= 0) {
+    throw new Error('inputAmount must be positive');
+  }
+
+  // Step 1: Quote the buy leg (inputAsset → outputAsset) on the cheaper pool.
+  const buyQuote  = quoteSwap(buyPoolId,  inputAsset, inputAmount);
+
+  // Step 2: Quote the sell leg (outputAsset → inputAsset) on the dearer pool.
+  const sellQuote = quoteSwap(sellPoolId, buyQuote.outputAsset, buyQuote.amountOut);
+
+  // Gross profit = final output minus original input, denominated in inputAsset.
+  const grossProfit = sellQuote.amountOut - Number(inputAmount);
+
+  // Step 3: Deduct AMM pool swap fees (both legs already have the fee baked in
+  //         via quoteSwap's feeMultiplier, but we surface them explicitly here
+  //         so callers see a clear breakdown).
+  const poolFeeRate = POOL_FEE_BPS / 10_000;
+  const poolFee =
+    Number(inputAmount) * poolFeeRate +
+    buyQuote.amountOut   * poolFeeRate;
+
+  // Step 4: Deduct estimated Horizon network fees.
+  //   baseFeeStroops per operation, converted from stroops → XLM → USD.
+  const networkFeeXlm = (baseFeeStroops * operationsCount) / 10_000_000;
+  const networkFeeUsd = networkFeeXlm * xlmExchangeRate;
+
+  const totalFees = poolFee + networkFeeUsd;
+  const netProfit = grossProfit - totalFees;
+  const roiPct    = (netProfit / Number(inputAmount)) * 100;
+
+  const isProfitable =
+    netProfit  > minProfitUsd &&
+    roiPct     > minRoiPct;
+
+  return {
+    buyPoolId,
+    sellPoolId,
+    inputAsset,
+    inputAmount: Number(inputAmount),
+    grossProfit,
+    poolFee,
+    networkFeeUsd,
+    totalFees,
+    netProfit,
+    roiPct,
+    isProfitable,
+  };
+}

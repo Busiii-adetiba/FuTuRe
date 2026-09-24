@@ -2,6 +2,48 @@ import StellarSdk from 'stellar-sdk';
 import { horizonServer, networkPassphrase } from '../config/stellar.js';
 import logger from '../config/logger.js';
 
+// Each trustline (subentry) requires a 0.5 XLM base reserve on Stellar.
+const TRUSTLINE_RESERVE_XLM = 0.5;
+// XLM stroops per unit (1 XLM = 10_000_000 stroops)
+const STROOPS_PER_XLM = 10_000_000;
+
+/**
+ * Check whether `sourceAccount` already has a trustline for the given liquidity
+ * pool share asset, and return the available XLM balance after accounting for
+ * all subentry reserves and liabilities.
+ *
+ * @param {object} sourceAccount - Horizon account record (returned by loadAccount)
+ * @param {string} poolId - Liquidity pool ID to check for
+ * @returns {{ hasTrustline: boolean, availableXlm: number }}
+ */
+function inspectPoolTrustline(sourceAccount, poolId) {
+  let xlmBalance = 0;
+  let hasTrustline = false;
+
+  for (const balance of sourceAccount.balances) {
+    if (balance.asset_type === 'native') {
+      xlmBalance = parseFloat(balance.balance);
+    }
+    if (
+      balance.asset_type === 'liquidity_pool_shares' &&
+      balance.liquidity_pool_id === poolId
+    ) {
+      hasTrustline = true;
+    }
+  }
+
+  // Stellar minimum balance: (2 + subentry_count) * base_reserve (0.5 XLM each).
+  // The account object exposes subentry_count directly.
+  const subentryCount = sourceAccount.subentry_count ?? 0;
+  const minimumBalance = (2 + subentryCount) * TRUSTLINE_RESERVE_XLM;
+  // Also subtract selling liabilities from the native balance.
+  const nativeBalance = sourceAccount.balances.find((b) => b.asset_type === 'native');
+  const sellingLiabilities = parseFloat(nativeBalance?.selling_liabilities ?? '0');
+  const availableXlm = xlmBalance - minimumBalance - sellingLiabilities;
+
+  return { hasTrustline, availableXlm };
+}
+
 const BASE_FEE = '100'; // in stroops (0.01 XLM)
 const MINIMUM_DEPOSIT = '1'; // minimum deposit in native units
 const MINIMUM_WITHDRAW = '1'; // minimum shares to withdraw
@@ -124,13 +166,21 @@ export async function estimateWithdrawFees(poolId, shares, slippageTolerance) {
 
 /**
  * Submit a `liquidityPoolDeposit` operation to add liquidity to a Stellar liquidity pool.
+ *
+ * Before building the transaction, this function:
+ *   1. Inspects the source account's balances for an existing pool-share trustline.
+ *   2. If the trustline is absent, validates that the account has at least
+ *      `TRUSTLINE_RESERVE_XLM` (0.5 XLM) of available reserve capacity, then
+ *      prepends a `changeTrust` operation so the trustline is established atomically
+ *      in the same transaction as the deposit.
+ *
  * @param {string} sourceSecret - Secret key of the depositing account
  * @param {string} poolId - Liquidity pool id
  * @param {number|string} amountA - Max amount of the pool's first asset to deposit
  * @param {number|string} amountB - Max amount of the pool's second asset to deposit
  * @param {number|string} slippageTolerance - Allowed slippage as a percentage (e.g. 1 for 1%)
- * @returns {Promise<{success: boolean, hash: string, ledger: number, sharesReceived: string}>} Submission result
- * @throws {Error} If required parameters are missing or Horizon submission fails
+ * @returns {Promise<{success: boolean, hash: string, ledger: number, sharesReceived: string, trustlineCreated: boolean}>} Submission result
+ * @throws {Error} If required parameters are missing, insufficient XLM reserve, or Horizon submission fails
  */
 export async function executeDeposit(sourceSecret, poolId, amountA, amountB, slippageTolerance) {
   try {
@@ -141,23 +191,54 @@ export async function executeDeposit(sourceSecret, poolId, amountA, amountB, sli
     const keypair = StellarSdk.Keypair.fromSecret(sourceSecret);
     const sourceAccount = await horizonServer.loadAccount(keypair.publicKey());
 
+    // ── ISSUE-051: Trustline check ──────────────────────────────────────────
+    const { hasTrustline, availableXlm } = inspectPoolTrustline(sourceAccount, poolId);
+    let trustlineCreated = false;
+
+    if (!hasTrustline) {
+      // Establishing a new trustline costs 0.5 XLM from the account's reserve.
+      if (availableXlm < TRUSTLINE_RESERVE_XLM) {
+        throw new Error(
+          `Insufficient XLM reserve to establish pool share trustline. ` +
+          `Available: ${availableXlm.toFixed(7)} XLM, required: ${TRUSTLINE_RESERVE_XLM} XLM.`
+        );
+      }
+      trustlineCreated = true;
+      logger.info('pool.deposit.trustlineRequired', {
+        sourceAccount: keypair.publicKey(),
+        poolId,
+        availableXlm,
+      });
+    }
+    // ───────────────────────────────────────────────────────────────────────
+
     const estimate = await estimateDepositFees(poolId, amountA, amountB, slippageTolerance);
 
-    const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+    const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
       fee: StellarSdk.BASE_FEE,
       networkPassphrase,
-    })
-      .addOperation(
-        StellarSdk.Operation.liquidityPoolDeposit({
-          liquidityPoolId: poolId,
-          maxAmountA: amountA.toString(),
-          maxAmountB: amountB.toString(),
-          minPrice: '0.1', // Placeholder
-          maxPrice: '10', // Placeholder
+    });
+
+    // Prepend changeTrust if the account lacks a trustline for this pool's share asset.
+    if (trustlineCreated) {
+      txBuilder.addOperation(
+        StellarSdk.Operation.changeTrust({
+          asset: new StellarSdk.LiquidityPoolAsset(poolId),
         })
-      )
-      .setTimeout(300)
-      .build();
+      );
+    }
+
+    txBuilder.addOperation(
+      StellarSdk.Operation.liquidityPoolDeposit({
+        liquidityPoolId: poolId,
+        maxAmountA: amountA.toString(),
+        maxAmountB: amountB.toString(),
+        minPrice: '0.1', // Placeholder
+        maxPrice: '10', // Placeholder
+      })
+    );
+
+    const transaction = txBuilder.setTimeout(300).build();
 
     transaction.sign(keypair);
     const result = await horizonServer.submitTransaction(transaction);
@@ -167,6 +248,7 @@ export async function executeDeposit(sourceSecret, poolId, amountA, amountB, sli
       poolId,
       amountA,
       amountB,
+      trustlineCreated,
       hash: result.hash,
     });
 
@@ -175,6 +257,7 @@ export async function executeDeposit(sourceSecret, poolId, amountA, amountB, sli
       hash: result.hash,
       ledger: result.ledger,
       sharesReceived: estimate.sharesReceived,
+      trustlineCreated,
     };
   } catch (error) {
     logger.error('pool.deposit.error', {

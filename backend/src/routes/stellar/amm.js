@@ -3,6 +3,7 @@ import { body, param } from 'express-validator';
 import * as AMMService from '../../services/amm.js';
 import { validate } from '../../middleware/validate.js';
 import { createRateLimiter } from '../../middleware/rateLimiter.js';
+import { validateAssetParams, validateAssetBody } from '../../utils/assetValidation.js';
 
 const router = express.Router();
 
@@ -55,6 +56,8 @@ router.post(
   positiveFloat('reserveB'),
   body('feeBps').optional().isInt({ min: 0 }).withMessage('feeBps must be a non-negative integer'),
   validate,
+  // ISSUE-048: Validate assetA and assetB as proper Stellar asset identifiers.
+  validateAssetBody('assetA', 'assetB'),
   (req, res) => {
     try {
       res.json(AMMService.registerPool(req.body));
@@ -80,6 +83,8 @@ router.post(
   positiveFloat('amountIn'),
   body('traderId').optional().isString().trim().notEmpty().withMessage('traderId must be a non-empty string'),
   validate,
+  // ISSUE-048: Validate inputAsset as a proper Stellar asset identifier.
+  validateAssetBody('inputAsset'),
   (req, res) => {
     try {
       res.json(AMMService.executeSwap(req.body));
@@ -94,6 +99,8 @@ router.get(
   param('assetA').isString().trim().notEmpty().withMessage('assetA must be a non-empty string'),
   param('assetB').isString().trim().notEmpty().withMessage('assetB must be a non-empty string'),
   validate,
+  // ISSUE-048: Validate assetA and assetB as proper Stellar asset identifiers.
+  validateAssetParams('assetA', 'assetB'),
   (req, res) => {
     const opportunities = AMMService.detectArbitrageOpportunities([
       req.params.assetA,
@@ -169,5 +176,28 @@ router.get('/risk', (req, res) => {
 router.get('/optimize', (req, res) => {
   res.json(AMMService.optimizeAMMPerformance());
 });
+
+// ── ISSUE-050: Fee-aware arbitrage calculation endpoint ───────────────────────
+
+router.post(
+  '/arbitrage/calculate',
+  body('buyPoolId').isString().trim().notEmpty().withMessage('buyPoolId must be a non-empty string'),
+  body('sellPoolId').isString().trim().notEmpty().withMessage('sellPoolId must be a non-empty string'),
+  assetNameBody('inputAsset'),
+  positiveFloat('inputAmount'),
+  body('baseFeeStroops').optional().isInt({ min: 0 }).withMessage('baseFeeStroops must be a non-negative integer'),
+  body('operationsCount').optional().isInt({ min: 1 }).withMessage('operationsCount must be a positive integer'),
+  body('xlmExchangeRate').optional().isFloat({ gt: 0 }).withMessage('xlmExchangeRate must be a positive number'),
+  validate,
+  // ISSUE-048: Validate inputAsset as a proper Stellar asset identifier.
+  validateAssetBody('inputAsset'),
+  (req, res) => {
+    try {
+      res.json(AMMService.calculateArbitrage(req.body));
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  },
+);
 
 export default router;
