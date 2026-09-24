@@ -12,6 +12,8 @@ use soroban_sdk::{
     },
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Env, IntoVal, String,
+    testutils::{Address as _, Events as _},
+    token, vec, Address, BytesN, Env, IntoVal, String,
 };
 
 const CLOSE_IN: u64 = 1_000;
@@ -59,6 +61,42 @@ fn create(env: &Env, client: &PredictionMarketClient, creator: &Address, oracle:
 
 fn advance(env: &Env, secs: u64) {
     env.ledger().with_mut(|l| l.timestamp += secs);
+    // Tests below that don't move real collateral (everything except
+    // dispute/split/merge) don't need to observe this token, so a throwaway
+    // address here keeps every pre-existing call site untouched. Tests that
+    // do need to fund/transfer real collateral use `setup_with_token()`.
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin);
+    client.init(&admin, &treasury, &token_id);
+    (env, client, admin, treasury, oracle)
+}
+
+/// Like `setup()`, but also returns a live token client + its Stellar Asset
+/// Contract admin client so a test can mint collateral to users before
+/// calling `split`, `merge`, or `dispute` — all three now require real 1:1
+/// token transfers (#1258, #1260).
+fn setup_with_token() -> (
+    Env,
+    PredictionMarketClient<'static>,
+    Address,
+    Address,
+    Address,
+    token::Client<'static>,
+    token::StellarAssetClient<'static>,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PredictionMarket);
+    let client = PredictionMarketClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let token = token::Client::new(&env, &token_id);
+    let token_sac = token::StellarAssetClient::new(&env, &token_id);
+    client.init(&admin, &treasury, &token_id);
+    (env, client, admin, treasury, oracle, token, token_sac)
 }
 
 fn question(env: &Env) -> String {
@@ -112,6 +150,11 @@ fn test_dispute_admin_upholds_emergency_resolve() {
     let (env, client, admin, _treasury, oracle) = setup();
     let user = funded(&env, &client);
     let disputer = funded(&env, &client);
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    let disputer = Address::generate(&env);
+    let bond = 10_000_000i128; // == MIN_DISPUTE_BOND
+    token_sac.mint(&disputer, &bond);
 
     let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
@@ -119,8 +162,9 @@ fn test_dispute_admin_upholds_emergency_resolve() {
     client.close_market(&admin, &mid);
     client.oracle_report(&oracle, &mid, &false); // oracle says NO
 
-    // disputer challenges
-    client.dispute(&disputer, &mid, &50_000);
+    // disputer challenges, escrowing the bond into the contract
+    client.dispute(&disputer, &mid, &bond);
+    assert_eq!(token.balance(&disputer), 0);
 
     // admin upholds → flips to YES
     client.admin_uphold_dispute(&admin, &mid, &true);
@@ -139,18 +183,22 @@ fn test_dispute_admin_upholds_emergency_resolve() {
 fn test_dispute_rejected_bond_slashed_to_treasury() {
     let (env, client, admin, _treasury, oracle) = setup();
     let disputer = funded(&env, &client);
+    let (env, client, admin, _treasury, oracle, _token, token_sac) = setup_with_token();
+    let disputer = Address::generate(&env);
+    let bond = 10_000_000i128; // == MIN_DISPUTE_BOND
+    token_sac.mint(&disputer, &bond);
 
     let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
     client.close_market(&admin, &mid);
     client.oracle_report(&oracle, &mid, &true);
-    client.dispute(&disputer, &mid, &50_000);
+    client.dispute(&disputer, &mid, &bond);
 
     // admin rejects → bond slashed
     client.admin_reject_dispute(&admin, &mid);
 
     let treasury_bal = client.get_treasury_balance();
-    assert_eq!(treasury_bal, 50_000);
+    assert_eq!(treasury_bal, bond);
 
     // market reverts to Closed → can finalize
     client.finalize(&mid);
@@ -380,22 +428,73 @@ fn test_batch_redeem_partial_failure() {
 fn test_split_sell_half_merge_remaining() {
     let (env, client, admin, _treasury, oracle) = setup();
     let user = funded(&env, &client);
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &200_000);
 
     let mid = create(&env, &client, &admin, &oracle);
     client.seed_market(&admin, &mid, &1_000_000);
 
-    // split: get YES + NO shares for collateral
+    // split: 1:1 collateral is pulled from the user into contract escrow
     client.split(&user, &mid, &200_000);
+    assert_eq!(token.balance(&user), 0);
+    assert_eq!(token.balance(&client.address), 200_000);
     let pos = client.get_position(&mid, &user);
     assert_eq!(pos.yes_shares, 200_000);
     assert_eq!(pos.no_shares, 200_000);
 
     // "sell half" — simulate by buying more on the other side (no sell fn needed)
-    // merge remaining half
+    // merge remaining half → 1:1 collateral is returned to the user
     client.merge(&user, &mid, &100_000);
+    assert_eq!(token.balance(&user), 100_000);
+    assert_eq!(token.balance(&client.address), 100_000);
     let pos2 = client.get_position(&mid, &user);
     assert_eq!(pos2.yes_shares, 100_000);
     assert_eq!(pos2.no_shares, 100_000);
+}
+
+// ── 7b. Split/merge collateral enforcement (#1260) ───────────────────────────
+
+#[test]
+fn test_split_requires_positive_amount() {
+    let (env, client, admin, _treasury, oracle, _token, _token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+
+    let err = client.try_split(&user, &mid, &0).unwrap_err().unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+
+    let err = client.try_split(&user, &mid, &-1).unwrap_err().unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+}
+
+#[test]
+#[should_panic]
+fn test_split_fails_without_sufficient_collateral() {
+    let (env, client, admin, _treasury, oracle, _token, token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &100); // less than the amount they'll try to split
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+
+    // The token transfer traps on insufficient balance before any shares
+    // are minted — uncollateralized share minting is impossible.
+    client.split(&user, &mid, &1_000);
+}
+
+#[test]
+fn test_merge_returns_collateral_only_up_to_split_tokens() {
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &500_000);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+
+    client.split(&user, &mid, &500_000);
+    assert_eq!(token.balance(&client.address), 500_000);
+
+    client.merge(&user, &mid, &500_000);
+    assert_eq!(token.balance(&user), 500_000, "full collateral returned 1:1");
+    assert_eq!(token.balance(&client.address), 0);
 }
 
 // ── 8. Slippage exceeded ──────────────────────────────────────────────────────
@@ -677,4 +776,508 @@ fn test_timeout_refund_after_resolution_deadline() {
     let refund = client.redeem(&user, &mid);
     assert!(refund > 0);
     assert_eq!(token_balance(&env, &client, &user), before + refund);
+// ── 11. Zero-liquidity swaps (#1262) ─────────────────────────────────────────
+//
+// Trades against a market with no reserves, or with non-positive amounts, must
+// be rejected with a typed error and leave pool state untouched.
+
+#[test]
+fn test_zero_liquidity_swap_rejection() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let trader = Address::generate(&env);
+
+    // Fresh market: no seed, no LP deposits → both reserves are zero.
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    let before = client.get_market(&mid);
+    assert_eq!(before.yes_pool, 0);
+    assert_eq!(before.no_pool, 0);
+
+    // Zero-amount trades against the empty pool are rejected.
+    let err = client.try_buy_yes(&trader, &mid, &0, &0).unwrap_err().unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+    let err = client.try_buy_no(&trader, &mid, &0, &0).unwrap_err().unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+
+    // Negative amounts must never be able to drive reserves below zero.
+    let err = client
+        .try_buy_yes(&trader, &mid, &-1_000, &i128::MIN)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+    let err = client
+        .try_buy_no(&trader, &mid, &-1_000, &i128::MIN)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+
+    // A slippage bound that the empty pool cannot satisfy fails cleanly.
+    let err = client
+        .try_buy_yes(&trader, &mid, &1_000, &1_001)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::SlippageExceeded);
+
+    // No rejected trade may have mutated market or position state.
+    let after = client.get_market(&mid);
+    assert_eq!(after.yes_pool, 0);
+    assert_eq!(after.no_pool, 0);
+    assert_eq!(after.yes_shares, 0);
+    assert_eq!(after.no_shares, 0);
+    let pos = client.get_position(&mid, &trader);
+    assert_eq!(pos.yes_shares, 0);
+    assert_eq!(pos.no_shares, 0);
+
+    // Depleted LP pool: after the only LP exits, trades still behave
+    // deterministically rather than dividing by zero.
+    let lp = Address::generate(&env);
+    let lp_mid = client.create_market(&admin, &question(&env), &oracle);
+    let shares = client.add_liquidity(&lp, &lp_mid, &1_000_000);
+    client.remove_liquidity(&lp, &lp_mid, &shares);
+    let drained = client.get_market(&lp_mid);
+    assert_eq!(drained.lp_pool, 0);
+    assert_eq!(drained.total_lp_shares, 0);
+    let err = client
+        .try_buy_yes(&trader, &lp_mid, &0, &0)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+    assert!(client.buy_yes(&trader, &lp_mid, &10_000, &1) > 0);
+}
+
+// ── 12. CPMM arithmetic overflow protection (#1262) ──────────────────────────
+//
+// Extreme i128 quantities must surface `Error::ArithmeticOverflow` instead of
+// panicking, and must not partially apply any state change.
+
+#[test]
+fn test_cpmm_arithmetic_overflow_protection() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let trader = Address::generate(&env);
+    let lp = Address::generate(&env);
+
+    // Trade overflow: own_pool + amount exceeds i128::MAX.
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    let err = client
+        .try_buy_yes(&trader, &mid, &i128::MAX, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+    let err = client
+        .try_buy_no(&trader, &mid, &i128::MAX, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+
+    // Share calculation overflow: amount * (yes_pool + no_pool) exceeds i128::MAX.
+    let err = client
+        .try_buy_yes(&trader, &mid, &(i128::MAX / 2), &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+
+    let market = client.get_market(&mid);
+    assert_eq!(market.yes_pool, 1_000_000);
+    assert_eq!(market.no_pool, 1_000_000);
+    assert_eq!(market.yes_shares, 0);
+    assert_eq!(market.no_shares, 0);
+    assert_eq!(client.get_position(&mid, &trader).yes_shares, 0);
+
+    // Seed overflow: reserves already at i128::MAX cannot be topped up.
+    let seed_mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &seed_mid, &i128::MAX);
+    let err = client
+        .try_seed_market(&admin, &seed_mid, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+    // With reserves at i128::MAX, even a 1-unit trade overflows the CPMM formula.
+    let err = client
+        .try_buy_yes(&trader, &seed_mid, &1, &0)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+
+    // LP overflow: a bootstrap deposit of i128::MAX saturates lp_pool, so any
+    // further deposit must be rejected rather than wrapping.
+    let lp_mid = client.create_market(&admin, &question(&env), &oracle);
+    let shares = client.add_liquidity(&lp, &lp_mid, &i128::MAX);
+    assert_eq!(shares, i128::MAX);
+    let err = client
+        .try_add_liquidity(&lp, &lp_mid, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::ArithmeticOverflow);
+    let lp_market = client.get_market(&lp_mid);
+    assert_eq!(lp_market.lp_pool, i128::MAX);
+    assert_eq!(lp_market.total_lp_shares, i128::MAX);
+    assert_eq!(client.get_position(&lp_mid, &lp).lp_shares, i128::MAX);
+}
+
+// ── 13. Sequential multi-LP fee distribution (#1262) ─────────────────────────
+//
+// Several LPs deposit, trades happen in between, and LPs withdraw in a
+// different order than they joined. Every LP share must be worth the same
+// amount at every step, fee claims must never exceed accrued fees, and the
+// pool must end fully drained with nothing stranded.
+
+#[test]
+fn test_sequential_lp_fee_distribution_equality() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let lp_a = Address::generate(&env);
+    let lp_b = Address::generate(&env);
+    let lp_c = Address::generate(&env);
+    let trader = Address::generate(&env);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+
+    // LP-A bootstraps: 1:1 shares.
+    let shares_a = client.add_liquidity(&lp_a, &mid, &1_000_000);
+    assert_eq!(shares_a, 1_000_000);
+
+    // A trade between deposits must not dilute or inflate later LP shares.
+    client.buy_yes(&trader, &mid, &100_000, &1);
+
+    let shares_b = client.add_liquidity(&lp_b, &mid, &500_000);
+    assert_eq!(shares_b, 500_000);
+
+    client.buy_no(&trader, &mid, &50_000, &1);
+
+    let shares_c = client.add_liquidity(&lp_c, &mid, &250_000);
+    assert_eq!(shares_c, 250_000);
+
+    let market = client.get_market(&mid);
+    assert_eq!(market.lp_pool, 1_750_000);
+    assert_eq!(market.total_lp_shares, shares_a + shares_b + shares_c);
+
+    // Fee claims are proportional to shares and in total can never exceed
+    // what has accrued in the pool.
+    let accrued = market.lp_fees;
+    let fee_a = client.claim_lp_fees(&lp_a, &mid);
+    let fee_b = client.claim_lp_fees(&lp_b, &mid);
+    let fee_c = client.claim_lp_fees(&lp_c, &mid);
+    assert!(fee_a >= 0 && fee_b >= 0 && fee_c >= 0);
+    assert!(fee_a + fee_b + fee_c <= accrued);
+    // Shares are 4:2:1, so claims must respect that ordering.
+    assert!(fee_a >= fee_b && fee_b >= fee_c);
+    assert!(client.get_market(&mid).lp_fees >= 0);
+
+    // Withdraw out of order: B fully, A half, C fully, then A's remainder.
+    // Every withdrawal must pay exactly shares * lp_pool / total_lp_shares.
+    let payout_b = client.remove_liquidity(&lp_b, &mid, &shares_b);
+    assert_eq!(payout_b, 500_000);
+
+    let half_a = shares_a / 2;
+    let payout_a1 = client.remove_liquidity(&lp_a, &mid, &half_a);
+    assert_eq!(payout_a1, 500_000);
+
+    let payout_c = client.remove_liquidity(&lp_c, &mid, &shares_c);
+    assert_eq!(payout_c, 250_000);
+
+    let payout_a2 = client.remove_liquidity(&lp_a, &mid, &(shares_a - half_a));
+    assert_eq!(payout_a2, 500_000);
+
+    // Total paid out equals total deposited; nothing is stranded.
+    assert_eq!(
+        payout_a1 + payout_a2 + payout_b + payout_c,
+        1_000_000 + 500_000 + 250_000
+    );
+    let drained = client.get_market(&mid);
+    assert_eq!(drained.lp_pool, 0);
+    assert_eq!(drained.total_lp_shares, 0);
+
+    // Exited LPs hold nothing and cannot claim further fees.
+    assert_eq!(client.get_position(&mid, &lp_a).lp_shares, 0);
+    let err = client.try_claim_lp_fees(&lp_c, &mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::NothingToRedeem);
+
+    // Over-withdrawal is rejected.
+    let err = client
+        .try_remove_liquidity(&lp_b, &mid, &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InsufficientFunds);
+}
+
+// ── 14. Full dispute state machine (#1262) ───────────────────────────────────
+//
+// Closed → Disputed → (reject) Closed → Disputed → (uphold) EmergencyResolved
+// → Resolved, plus the illegal transitions along the way.
+
+#[test]
+fn test_full_dispute_lifecycle_uphold_and_reject() {
+    use prediction_market::MarketStatus;
+
+    let (env, client, admin, _treasury, oracle) = setup();
+    let user_yes = Address::generate(&env);
+    let user_no = Address::generate(&env);
+    let disputer_1 = Address::generate(&env);
+    let disputer_2 = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.buy_yes(&user_yes, &mid, &100_000, &1);
+    client.buy_no(&user_no, &mid, &100_000, &1);
+
+    // Cannot dispute an open market.
+    let err = client
+        .try_dispute(&disputer_1, &mid, &50_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+
+    client.close_market(&admin, &mid);
+
+    // Cannot dispute before the oracle has reported.
+    let err = client
+        .try_dispute(&disputer_1, &mid, &50_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidOutcome);
+
+    // Admin cannot rule on a market that is not disputed.
+    assert!(client.try_admin_reject_dispute(&admin, &mid).is_err());
+    assert!(client.try_admin_uphold_dispute(&admin, &mid, &true).is_err());
+
+    // Oracle reports NO.
+    client.oracle_report(&oracle, &mid, &false);
+
+    // ── Round 1: dispute rejected, bond slashed ──────────────────────────────
+    client.dispute(&disputer_1, &mid, &50_000);
+    let m = client.get_market(&mid);
+    assert_eq!(m.status, MarketStatus::Disputed);
+    assert_eq!(m.disputer, Some(disputer_1.clone()));
+    assert_eq!(m.dispute_bond, 50_000);
+
+    // While disputed: no finalize, no redeem, no second concurrent dispute.
+    let err = client.try_finalize(&mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+    let err = client.try_redeem(&user_no, &mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::MarketNotResolved);
+    let err = client
+        .try_dispute(&disputer_2, &mid, &10_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+
+    // Only the admin may rule.
+    let err = client
+        .try_admin_reject_dispute(&stranger, &mid)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+    let err = client
+        .try_admin_uphold_dispute(&stranger, &mid, &true)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+
+    client.admin_reject_dispute(&admin, &mid);
+    assert_eq!(client.get_treasury_balance(), 50_000);
+    let m = client.get_market(&mid);
+    assert_eq!(m.status, MarketStatus::Closed);
+    assert_eq!(m.disputer, None);
+    assert_eq!(m.dispute_bond, 0);
+    assert_eq!(m.outcome, Some(false), "rejection must keep the oracle outcome");
+
+    // ── Round 2: re-dispute upheld, outcome overridden ───────────────────────
+    client.dispute(&disputer_2, &mid, &75_000);
+    let m = client.get_market(&mid);
+    assert_eq!(m.status, MarketStatus::Disputed);
+    assert_eq!(m.disputer, Some(disputer_2.clone()));
+    assert_eq!(m.dispute_bond, 75_000);
+
+    client.admin_uphold_dispute(&admin, &mid, &true);
+    let m = client.get_market(&mid);
+    assert_eq!(m.status, MarketStatus::EmergencyResolved);
+    assert_eq!(m.outcome, Some(true), "upheld dispute must override outcome");
+    // Upholding does not slash: treasury only holds the round-1 bond.
+    assert_eq!(client.get_treasury_balance(), 50_000);
+
+    // Cannot re-dispute or re-rule once emergency-resolved.
+    let err = client
+        .try_dispute(&disputer_1, &mid, &10_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+    assert!(client.try_admin_reject_dispute(&admin, &mid).is_err());
+
+    // ── Finalize and settle on the overridden outcome ────────────────────────
+    client.finalize(&mid);
+    assert_eq!(client.get_market(&mid).status, MarketStatus::Resolved);
+
+    let payout = client.redeem(&user_yes, &mid);
+    assert!(payout > 0);
+    let err = client.try_redeem(&user_no, &mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::NothingToRedeem);
+
+    // Resolved markets are terminal for the dispute machine.
+    let err = client
+        .try_dispute(&disputer_1, &mid, &10_000)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+    let err = client.try_finalize(&mid).unwrap_err().unwrap();
+    assert_eq!(err, Error::MarketNotClosed);
+// ── 11. Emergency upgrade & market containment (#1259) ────────────────────────
+
+#[test]
+fn test_upgrade_rejects_non_admin() {
+    let (env, client, _admin, _treasury, _oracle) = setup();
+    let attacker = Address::generate(&env);
+    let fake_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    // Non-admin is rejected before the deployer is ever touched. A full
+    // successful WASM-swap round trip requires a second compiled contract
+    // binary uploaded via the deployer, which isn't available in this unit
+    // test crate — that path is exercised in deployment/integration testing
+    // outside `cargo test`, not here.
+    let err = client.try_upgrade(&attacker, &fake_hash).unwrap_err().unwrap();
+    assert_eq!(err, Error::Unauthorized);
+}
+
+#[test]
+fn test_emergency_drain_market_rejects_non_admin() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let attacker = Address::generate(&env);
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+
+    let err = client
+        .try_emergency_drain_market(&attacker, &mid)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+
+    // Rejected call must not have touched the market.
+    let market = client.get_market(&mid);
+    assert_eq!(market.status, prediction_market::MarketStatus::Open);
+}
+
+#[test]
+fn test_emergency_drain_market_cancels_and_preserves_storage() {
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
+    let user = Address::generate(&env);
+    token_sac.mint(&user, &300_000);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.split(&user, &mid, &300_000);
+
+    // Admin-gated emergency containment.
+    client.emergency_drain_market(&admin, &mid);
+    let market = client.get_market(&mid);
+    assert_eq!(market.status, prediction_market::MarketStatus::Cancelled);
+    // Unrelated market fields survive the drain untouched.
+    assert_eq!(market.creator, admin);
+    assert_eq!(market.question, question(&env));
+
+    // Holders recover their position through the existing cancelled-market
+    // refund path, including real collateral for the split-originated shares.
+    let refund = client.redeem(&user, &mid);
+    assert_eq!(refund, 600_000); // 300_000 yes + 300_000 no shares, 1:1
+    assert_eq!(token.balance(&user), 300_000);
+    assert_eq!(token.balance(&client.address), 0);
+
+    // Draining an already-cancelled market fails cleanly instead of
+    // double-cancelling.
+    let err = client
+        .try_emergency_drain_market(&admin, &mid)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::MarketAlreadyCancelled);
+}
+
+// ── 12. Redeem payout precision & dust routing (#1257) ────────────────────────
+
+#[test]
+fn test_redeem_precision_dust_flushes_to_lp_fees_with_exact_conservation() {
+    let (env, client, admin, _treasury, oracle) = setup();
+    let buyer_a = Address::generate(&env);
+    let buyer_b = Address::generate(&env);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    // Fresh, unseeded market: the first buy lands on calc_shares' 0/0
+    // bootstrap branch (shares == amount), so pool/share state — and thus
+    // the exact payout math below — is fully predictable.
+    let shares_a = client.buy_yes(&buyer_a, &mid, &3, &1);
+    assert_eq!(shares_a, 3);
+    let shares_b = client.buy_yes(&buyer_b, &mid, &4, &1);
+    // shares_b = 4 * (0 + 3) / (3 + 4) = 12 / 7 = 1 (truncated) — a
+    // deliberately non-evenly-divisible share split.
+    assert_eq!(shares_b, 1);
+
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+    client.finalize(&mid);
+
+    let market = client.get_market(&mid);
+    let total_pool = market.yes_pool + market.no_pool;
+    let total_winning = market.yes_shares;
+    assert_eq!(total_pool, 7);
+    assert_eq!(total_winning, 4);
+
+    let payout_a = client.redeem(&buyer_a, &mid);
+    let payout_b = client.redeem(&buyer_b, &mid);
+
+    // Exact payouts, independently computed with the same PRECISION-scaled
+    // single-division formula the contract uses internally.
+    assert_eq!(payout_a, 5); // (3 * 10_000_000 * 7) / 4 / 10_000_000 = 5
+    assert_eq!(payout_b, 1); // (1 * 10_000_000 * 7) / 4 / 10_000_000 = 1
+
+    // Nothing is unaccounted for: the truncated fractions from both
+    // redemptions (2_500_000 + 7_500_000 == PRECISION) flush into exactly
+    // one whole lp_fees unit, leaving zero pending dust.
+    let market_after = client.get_market(&mid);
+    assert_eq!(market_after.lp_fees, 1);
+    assert_eq!(market_after.dust, 0);
+
+    // Conservation invariant: every unit of the pool ends up either paid
+    // out or routed to claimable LP fees — nothing vanishes, nothing is
+    // fabricated.
+    assert_eq!(payout_a + payout_b + market_after.lp_fees, total_pool);
+}
+
+// ── 13. Dispute bond escrow (#1258) ───────────────────────────────────────────
+
+#[test]
+fn test_dispute_rejects_bond_below_minimum() {
+    let (env, client, admin, _treasury, oracle, token, token_sac) = setup_with_token();
+    let disputer = Address::generate(&env);
+    token_sac.mint(&disputer, &10_000_000);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+
+    // Below MIN_DISPUTE_BOND (10_000_000) → rejected before any token
+    // transfer is attempted, and the disputer's balance is untouched.
+    let err = client
+        .try_dispute(&disputer, &mid, &9_999_999)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidAmount);
+    assert_eq!(token.balance(&disputer), 10_000_000);
+
+    let market = client.get_market(&mid);
+    assert_eq!(market.status, prediction_market::MarketStatus::Closed);
+}
+
+#[test]
+#[should_panic]
+fn test_dispute_fails_without_sufficient_balance() {
+    let (env, client, admin, _treasury, oracle, _token, token_sac) = setup_with_token();
+    let disputer = Address::generate(&env);
+    // Funded below the bond they'll attempt to post.
+    token_sac.mint(&disputer, &5_000_000);
+
+    let mid = client.create_market(&admin, &question(&env), &oracle);
+    client.seed_market(&admin, &mid, &1_000_000);
+    client.close_market(&admin, &mid);
+    client.oracle_report(&oracle, &mid, &true);
+
+    // Bond clears MIN_DISPUTE_BOND but exceeds the disputer's real balance —
+    // the token transfer traps before the market is marked Disputed.
+    client.dispute(&disputer, &mid, &10_000_000);
 }
