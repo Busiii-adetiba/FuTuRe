@@ -1,3 +1,4 @@
+// ISSUE-044: horizonServer is now re-exported from the canonical config/stellar.js
 import { horizonServer } from '../config/stellar.js';
 import logger from '../config/logger.js';
 import prisma from '../db/client.js';

@@ -70,7 +70,7 @@ function logError(req, error, context = {}) {
  *       500:
  *         description: Server error
  */
-router.post('/account/create', rules.createMultiSig, validate, async (req, res) => {
+router.post('/account/create', rules.createMultiSig, validate, async (req, res, next) => {
   try {
     const { sourceSecret, signers, thresholds, masterWeight } = req.body;
     const result = await MultiSigService.createMultiSigAccount(
@@ -82,6 +82,9 @@ router.post('/account/create', rules.createMultiSig, validate, async (req, res) 
     broadcastToAccount(result.publicKey, { type: 'multisig_created', ...result });
     res.json(result);
   } catch (error) {
+    if (error.status === 400) {
+      return next(new AppError(error.message, 400, ErrorCodes.VALIDATION_ERROR));
+    }
     logError(req, error);
     res.status(500).json({ error: 'Failed to create multi-sig account' });
   }
@@ -147,12 +150,15 @@ router.get('/account/:publicKey', rules.publicKeyParam, validate, async (req, re
  *       500:
  *         description: Server error
  */
-router.post('/account/update', rules.updateMultiSig, validate, async (req, res) => {
+router.post('/account/update', rules.updateMultiSig, validate, async (req, res, next) => {
   try {
     const { sourceSecret, ...updates } = req.body;
     const result = await MultiSigService.updateMultiSigConfig(sourceSecret, updates);
     res.json(result);
   } catch (error) {
+    if (error.status === 400) {
+      return next(new AppError(error.message, 400, ErrorCodes.VALIDATION_ERROR));
+    }
     logError(req, error);
     res.status(500).json({ error: 'Failed to update multi-sig configuration' });
   }
@@ -218,15 +224,24 @@ router.post('/transaction/build', idempotencyMiddleware, rules.buildMultiSigTx, 
  *         application/json:
  *           schema:
  *             type: object
- *             required: [txId, signerSecret]
+ *             required: [txId]
  *             properties:
  *               txId:
  *                 type: string
  *               signerSecret:
  *                 type: string
+ *                 description: Signer secret (server signs). Required unless signedXdr is provided.
+ *               signedXdr:
+ *                 type: string
+ *                 description: Client-signed transaction envelope. Every signature is verified against the transaction hash for the configured network.
+ *               signerPublicKey:
+ *                 type: string
+ *                 description: Optional public key the client-signed envelope must contain a valid signature from.
  *     responses:
  *       200:
  *         description: Signature added
+ *       400:
+ *         description: InvalidSignature — a signature failed cryptographic verification
  *       410:
  *         description: Transaction expired
  *       500:
@@ -234,10 +249,17 @@ router.post('/transaction/build', idempotencyMiddleware, rules.buildMultiSigTx, 
  */
 router.post('/transaction/sign', rules.signMultiSigTx, validate, async (req, res, next) => {
   try {
-    const { txId, signerSecret } = req.body;
-    const result = await MultiSigService.addSignature(txId, signerSecret);
+    const { txId, signerSecret, signedXdr, signerPublicKey } = req.body;
+    const result = await MultiSigService.addSignature(
+      txId,
+      signedXdr ? { signedXdr, signerPublicKey } : { signerSecret }
+    );
     res.json(result);
   } catch (error) {
+    if (error.name === 'InvalidSignatureError' || error.status === 400) {
+      logger.warn('multisig.signature.rejected', { txId: req.body.txId, error: error.message, details: error.details });
+      return next(new AppError(error.message, 400, ErrorCodes.VALIDATION_ERROR, error.details));
+    }
     if (error.message?.includes('expired')) {
       return next(new AppError(error.message, 410, ErrorCodes.CONFLICT));
     }
@@ -340,7 +362,7 @@ router.post('/transaction/verify', rules.verifyMultiSigTx, validate, async (req,
  */
 router.get('/transaction/pending/:publicKey', rules.publicKeyParam, validate, async (req, res) => {
   try {
-    const transactions = MultiSigService.getPendingTransactions(req.params.publicKey);
+    const transactions = await MultiSigService.getPendingTransactions(req.params.publicKey);
     res.json({ transactions });
   } catch (error) {
     logError(req, error, { publicKey: req.params.publicKey });
@@ -370,7 +392,7 @@ router.get('/transaction/pending/:publicKey', rules.publicKeyParam, validate, as
  */
 router.get('/transaction/:txId', async (req, res) => {
   try {
-    const tx = MultiSigService.getPendingTransaction(req.params.txId);
+    const tx = await MultiSigService.getPendingTransaction(req.params.txId);
     if (!tx) return res.status(404).json({ error: 'Transaction not found' });
     res.json(tx);
   } catch (error) {
