@@ -6,6 +6,7 @@ import { sendScheduledDigests } from './services/digestGenerator.js';
 import { checkAllUserBalances } from './services/lowBalanceMonitor.js';
 import { processDueWebhookDeliveries } from './webhooks/dispatcher.js';
 import { recordFeeSnapshot, purgeStaleFeeSnapshots } from './services/feeHistory.js';
+import { processSep31StatusPolls } from './services/sep31.js';
 import { refreshAllRates, RATE_REFRESH_INTERVAL_MS } from './services/exchangeRate.js';
 
 let intervals = [];
@@ -48,6 +49,16 @@ export async function startScheduler() {
   }, 10 * 1000);
   intervals.push(webhookDeliveryInterval);
 
+  // SEP-31 status polling worker - adaptive backoff happens per row in service layer
+  const sep31PollInterval = setInterval(async () => {
+    try {
+      const count = await processSep31StatusPolls();
+      if (count > 0) logger.info('scheduler.sep31.processed', { count });
+    } catch (err) {
+      logger.error('scheduler.sep31.failed', { error: err.message });
+    }
+  }, 15 * 1000);
+  intervals.push(sep31PollInterval);
   // Exchange rate worker – fetch the full price matrix from CoinGecko in one
   // batched request and store it in Redis (`rates:all`) so request paths never
   // call CoinGecko directly. Warm the cache immediately on startup.

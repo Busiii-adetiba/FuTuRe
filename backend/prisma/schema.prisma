@@ -19,6 +19,7 @@ model User {
   amlStatus              String                  @default("CLEAR")  // CLEAR, HELD_FOR_REVIEW, BLOCKED
   amlHoldReason          String?                 // Reason why account is held
   amlHoldDate            DateTime?               // When the hold was placed
+  stellarAccountStatus   String                  @default("ACTIVE") // ACTIVE, PENDING_ACTIVATION
   settings               Setting?
   sentTxs                Transaction[]           @relation("sender")
   receivedTxs            Transaction[]           @relation("recipient")
@@ -38,6 +39,7 @@ model User {
 
   @@index([deletedAt])
   @@index([amlStatus])
+  @@index([stellarAccountStatus])
 }
 
 model Transaction {
@@ -538,6 +540,10 @@ model Sep31Transaction {
   anchorUrl         String
   externalId        String
   status            String   @default("pending_sender")
+  pollCount         Int      @default(0)
+  pollingActive     Boolean  @default(true)
+  terminalState     Boolean  @default(false)
+  nextPollAt        DateTime?
   amount            String
   assetCode         String?
   senderPublicKey   String?
@@ -550,6 +556,7 @@ model Sep31Transaction {
 
   @@unique([anchorUrl, externalId])
   @@index([status])
+  @@index([pollingActive, nextPollAt])
 }
 
 // Unique accounts that have received fee-bump sponsorship at least once.

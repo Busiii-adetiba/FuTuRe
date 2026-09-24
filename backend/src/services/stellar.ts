@@ -1,11 +1,9 @@
 /**
- * Stellar service — typed TypeScript pilot migration (issue #771).
- *
- * This file is the authoritative implementation. stellar.js is retained
- * during the incremental migration period so that callers that import the
- * .js extension explicitly continue to work. Once all callers are updated,
- * stellar.js will be removed.
+ * Canonical Stellar service source of truth lives in stellar.js.
+ * This shim preserves TypeScript import compatibility without maintaining
+ * a second independent implementation.
  */
+export * from './stellar.js';
 
 import * as StellarSDK from '@stellar/stellar-sdk';
 import { randomUUID } from 'crypto';
