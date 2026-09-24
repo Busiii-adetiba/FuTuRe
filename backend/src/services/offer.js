@@ -1,5 +1,7 @@
-import StellarSdk from 'stellar-sdk';
-import { horizonServer, networkPassphrase } from '../config/stellar.js';
+import * as StellarSdk from '@stellar/stellar-sdk';
+// ISSUE-044: horizonServer and networkPassphrase are now re-exported from the
+// canonical config/stellar.js (the file previously did not exist → fatal crash).
+import { horizonServer, getNetworkPassphrase } from '../config/stellar.js';
 import logger from '../config/logger.js';
 
 const XLM_ASSET = new StellarSdk.Asset.native();
@@ -83,7 +85,7 @@ export async function createOffer(sourceSecret, sellingAsset, buyingAsset, selli
 
     const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
       fee: StellarSdk.BASE_FEE,
-      networkPassphrase,
+      networkPassphrase: getNetworkPassphrase(),
     })
       .addOperation(
         StellarSdk.Operation.manageOffer({
@@ -171,7 +173,7 @@ export async function modifyOffer(
 
     const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
       fee: StellarSdk.BASE_FEE,
-      networkPassphrase,
+      networkPassphrase: getNetworkPassphrase(),
     })
       .addOperation(
         StellarSdk.Operation.manageOffer({
@@ -232,7 +234,7 @@ export async function cancelOffer(sourceSecret, offerId) {
     // Cancel by setting amount to 0
     const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
       fee: StellarSdk.BASE_FEE,
-      networkPassphrase,
+      networkPassphrase: getNetworkPassphrase(),
     })
       .addOperation(
         StellarSdk.Operation.manageOffer({
