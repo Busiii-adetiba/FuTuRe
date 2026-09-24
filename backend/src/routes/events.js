@@ -25,6 +25,7 @@ router.use(requireAuth);
  * /api/events/history/{aggregateId}:
  *   get:
  *     summary: Get event history for an aggregate
+ *     description: "Known limitation: event-sourcing state is in-memory, so it is not durable across deploys or shared across instances. See docs/guides/internal-tooling.md#event-sourcing"
  *     tags: [Events]
  *     parameters:
  *       - in: path
@@ -50,6 +51,7 @@ router.get('/history/:aggregateId', requireOwnAccount('aggregateId'), async (req
  * /api/events/state/{aggregateId}:
  *   get:
  *     summary: Get current state of an aggregate
+ *     description: "Known limitation: event-sourcing state is in-memory, so it is not durable across deploys or shared across instances. See docs/guides/internal-tooling.md#event-sourcing"
  *     tags: [Events]
  *     parameters:
  *       - in: path
@@ -72,6 +74,7 @@ router.get('/state/:aggregateId', requireOwnAccount('aggregateId'), async (req, 
  * /api/events/replay/{aggregateId}:
  *   get:
  *     summary: Replay events to a specific version
+ *     description: "Known limitation: event-sourcing state is in-memory, so it is not durable across deploys or shared across instances. See docs/guides/internal-tooling.md#event-sourcing"
  *     tags: [Events]
  *     parameters:
  *       - in: path
@@ -99,6 +102,7 @@ router.get('/replay/:aggregateId', requireOwnAccount('aggregateId'), async (req,
  * /api/events/projection/{name}:
  *   get:
  *     summary: Get a projection
+ *     description: "Known limitation: event-sourcing state is in-memory, so it is not durable across deploys or shared across instances. See docs/guides/internal-tooling.md#event-sourcing"
  *     tags: [Events]
  *     parameters:
  *       - in: path
@@ -121,6 +125,7 @@ router.get('/projection/:name', requireAdmin, async (req, res) => {
  * /api/events/analytics/{eventType}:
  *   get:
  *     summary: Get analytics for an event type
+ *     description: "Known limitation: event-sourcing state is in-memory, so it is not durable across deploys or shared across instances. See docs/guides/internal-tooling.md#event-sourcing"
  *     tags: [Events]
  *     parameters:
  *       - in: path
@@ -143,6 +148,7 @@ router.get('/analytics/:eventType', requireAdmin, async (req, res) => {
  * /api/events/stats:
  *   get:
  *     summary: Get event statistics
+ *     description: "Known limitation: event-sourcing state is in-memory, so it is not durable across deploys or shared across instances. See docs/guides/internal-tooling.md#event-sourcing"
  *     tags: [Events]
  */
 router.get('/stats', requireAdmin, async (req, res) => {
@@ -159,6 +165,7 @@ router.get('/stats', requireAdmin, async (req, res) => {
  * /api/events/archive:
  *   post:
  *     summary: Archive old events
+ *     description: "Known limitation: event-sourcing state is in-memory, so it is not durable across deploys or shared across instances. See docs/guides/internal-tooling.md#event-sourcing"
  *     tags: [Events]
  *     requestBody:
  *       required: true
@@ -186,6 +193,7 @@ router.post('/archive', requireAdmin, async (req, res) => {
  * /api/events/all:
  *   get:
  *     summary: Get all events with pagination
+ *     description: "Known limitation: event-sourcing state is in-memory, so it is not durable across deploys or shared across instances. See docs/guides/internal-tooling.md#event-sourcing"
  *     tags: [Events]
  *     parameters:
  *       - in: query

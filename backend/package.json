@@ -20,7 +20,8 @@
     "test:integration": "vitest run tests/stellar.integration.test.js",
     "test:db": "vitest run tests/database.framework.test.js",
     "test:integration:all": "vitest run tests/*.integration.test.js",
-    "db:seed": "node prisma/seed.js"
+    "db:seed": "node prisma/seed.js",
+    "db:rotate-encryption-keys": "node ../scripts/rotate-encryption-keys.mjs"
   },
   "prisma": {
     "seed": "node prisma/seed.js"

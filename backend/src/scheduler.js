@@ -1,11 +1,12 @@
 import logger from './config/logger.js';
 import { processActiveStreams } from './services/streaming.js';
-import { expireStaleTransactions } from './services/multiSig.js';
+import { cleanupExpiredMultiSigTransactions } from './services/multiSig.js';
 import { startScheduler as startBackupScheduler } from './backup/manager.js';
 import { sendScheduledDigests } from './services/digestGenerator.js';
 import { checkAllUserBalances } from './services/lowBalanceMonitor.js';
 import { processDueWebhookDeliveries } from './webhooks/dispatcher.js';
 import { recordFeeSnapshot, purgeStaleFeeSnapshots } from './services/feeHistory.js';
+import { refreshAllRates, RATE_REFRESH_INTERVAL_MS } from './services/exchangeRate.js';
 
 let intervals = [];
 
@@ -22,10 +23,12 @@ export async function startScheduler() {
   }, 60 * 1000);
   intervals.push(streamingInterval);
 
-  // Multi-sig expiry worker - check every minute
+  // Multi-sig expiry cleanup (#1287) - transition abandoned pending
+  // transactions to 'expired'. Runs every minute (tighter than the 10-minute
+  // minimum) since pending envelopes only live for 5 minutes.
   const multiSigInterval = setInterval(async () => {
     try {
-      const count = await expireStaleTransactions();
+      const count = await cleanupExpiredMultiSigTransactions();
       if (count > 0) logger.info('scheduler.multisig.expired', { count });
     } catch (err) {
       logger.error('scheduler.multisig.failed', { error: err.message });
@@ -44,6 +47,20 @@ export async function startScheduler() {
     }
   }, 10 * 1000);
   intervals.push(webhookDeliveryInterval);
+
+  // Exchange rate worker – fetch the full price matrix from CoinGecko in one
+  // batched request and store it in Redis (`rates:all`) so request paths never
+  // call CoinGecko directly. Warm the cache immediately on startup.
+  const refreshRates = async () => {
+    try {
+      await refreshAllRates();
+    } catch (err) {
+      logger.error('scheduler.exchangeRates.failed', { error: err.message });
+    }
+  };
+  refreshRates();
+  const exchangeRateInterval = setInterval(refreshRates, RATE_REFRESH_INTERVAL_MS);
+  intervals.push(exchangeRateInterval);
 
   // Backup scheduler
   try {

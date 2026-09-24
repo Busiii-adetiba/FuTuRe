@@ -26,6 +26,7 @@ const MAX_DURATION_SECONDS = 600;
  * /api/load-testing/scenarios/create:
  *   post:
  *     summary: Create a load test scenario
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
@@ -86,6 +87,7 @@ router.post('/scenarios/create', async (req, res) => {
  * /api/load-testing/run:
  *   post:
  *     summary: Run a load test scenario
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
@@ -130,6 +132,7 @@ router.post('/run', async (req, res) => {
  * /api/load-testing/results/{scenarioName}:
  *   get:
  *     summary: Get latest load test results for a scenario
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     parameters:
  *       - in: path
@@ -160,6 +163,7 @@ router.get('/results/:scenarioName', async (req, res) => {
  * /api/load-testing/baseline/establish:
  *   post:
  *     summary: Establish a performance baseline from latest results
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
@@ -202,6 +206,7 @@ router.post('/baseline/establish', async (req, res) => {
  * /api/load-testing/baseline/latest/{scenarioName}:
  *   get:
  *     summary: Get the latest performance baseline for a scenario
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     parameters:
  *       - in: path
@@ -228,6 +233,7 @@ router.get('/baseline/latest/:scenarioName', async (req, res) => {
  * /api/load-testing/regression/check:
  *   post:
  *     summary: Check for performance regressions against baseline
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
@@ -270,6 +276,7 @@ router.post('/regression/check', async (req, res) => {
  * /api/load-testing/bottlenecks/analyze:
  *   post:
  *     summary: Analyze bottlenecks from latest test results
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
@@ -311,6 +318,7 @@ router.post('/bottlenecks/analyze', async (req, res) => {
  * /api/load-testing/capacity/calculate:
  *   post:
  *     summary: Calculate current capacity from test results
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
@@ -351,6 +359,7 @@ router.post('/capacity/calculate', async (req, res) => {
  * /api/load-testing/capacity/project:
  *   post:
  *     summary: Project future capacity needs based on growth rate
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
@@ -396,6 +405,7 @@ router.post('/capacity/project', async (req, res) => {
  * /api/load-testing/alerts/check:
  *   post:
  *     summary: Check performance metrics against alert thresholds
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
@@ -437,6 +447,7 @@ router.post('/alerts/check', async (req, res) => {
  * /api/load-testing/alerts:
  *   get:
  *     summary: Get performance alerts
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     parameters:
  *       - in: query
@@ -463,6 +474,7 @@ router.get('/alerts', async (req, res) => {
  * /api/load-testing/alerts/critical:
  *   get:
  *     summary: Get critical performance alerts
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     responses:
  *       200:
@@ -484,6 +496,7 @@ router.get('/alerts/critical', async (req, res) => {
  * /api/load-testing/recommendations:
  *   post:
  *     summary: Get optimization recommendations from test results
+ *     description: "Known limitation: requests are issued serially, so this cannot generate genuine concurrent load. See docs/guides/internal-tooling.md#load-testing"
  *     tags: [LoadTesting]
  *     requestBody:
  *       required: true
