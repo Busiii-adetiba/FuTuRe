@@ -39,6 +39,9 @@ const streamRules = {
     body('rateAmount').isFloat({ gt: 0 }).withMessage('rateAmount must be a positive number'),
     body('intervalSeconds').optional().isInt({ min: 10 }).withMessage('intervalSeconds must be at least 10'),
     body('endTime').optional().isISO8601().withMessage('endTime must be a valid ISO8601 date'),
+    body('escrowContractId').isString().notEmpty().withMessage('escrowContractId is required for delegated streaming'),
+    body('contractStreamId').notEmpty().withMessage('contractStreamId is required for delegated streaming'),
+    body('senderSecret').not().exists().withMessage('senderSecret is not accepted; use delegated escrow'),
   ],
   idParam: [
     param('id').isUUID().withMessage('Invalid stream ID'),
@@ -98,6 +101,9 @@ router.post('/', idempotencyMiddleware, streamRules.create, validate, async (req
     logger.error('streaming.route.create.failed', { error: error.message });
     if (error.code === 'STREAM_LIMIT_EXCEEDED') {
       return res.status(429).json({ error: error.message });
+    }
+    if (error.code === 'CUSTODIAL_SECRET_REJECTED' || error.code === 'DELEGATED_STREAM_REQUIRED') {
+      return res.status(400).json({ error: error.message, code: error.code });
     }
     res.status(500).json({ error: error.message });
   }

@@ -1,12 +1,11 @@
 /* backend/src/services/streaming.js */
 import prisma from '../db/client.js';
-import { sendPayment } from './stellar.js';
 import { eventMonitor } from '../eventSourcing/index.js';
 import logger, { withContext } from '../config/logger.js';
-import { encryptToEnvValue, decryptFromEnvValue } from '../config/secrets.js';
 import { getSubscriptionByPublicKey, sendWebPush } from '../notifications/webPush.js';
 import { createRedisBackend } from '../cache/redis.js';
 import { incrementCounter } from '../monitoring/metrics.js';
+import { createDelegatedStreamEscrow, tickStreamPayment } from './streamContract.js';
 
 export { prisma };
 
@@ -53,46 +52,60 @@ async function claimStreamInterval(stream, now) {
 }
 
 /**
- * Per-stream secret encryption/decryption
- * 
- * SECURITY MODEL:
- * - Each PaymentStream stores an encrypted senderSecret
- * - Secrets are encrypted at rest using STREAM_SECRET_ENCRYPTION_KEY
- * - Decryption happens only during payment processing
- * - This is an interim solution before full delegated signing
- * 
- * See STREAMING_SECURITY.md for detailed security trade-offs and future improvements
+ * SECURITY MODEL (delegated, non-custodial):
+ * - Backend NEVER stores user private keys / senderSecret
+ * - Payments release from a Soroban StreamPayment escrow (see stellar-contract/src/stream_payment.rs)
+ * - Workers call permissionless tick_stream — key compromise cannot drain the primary account
+ *
+ * See STREAMING_SECURITY.md
  */
-function getStreamEncryptionKey() {
-  const key = process.env.STREAM_SECRET_ENCRYPTION_KEY;
-  if (!key) throw new Error('STREAM_SECRET_ENCRYPTION_KEY is not set');
-  return key;
-}
 
 /**
- * Create a new recurring payment stream with the sender's secret encrypted at rest.
+ * Create a new recurring payment stream backed by Soroban escrow (no stored secrets).
  * @param {object} params
  * @param {string} params.senderPublicKey - Stellar public key of the sender
- * @param {string} params.senderSecret - Plaintext secret key used to sign each interval payment
  * @param {string} params.recipientPublicKey - Stellar public key of the recipient
+ * @param {string} params.escrowContractId - Deployed StreamPayment contract (C...)
+ * @param {string|number} params.contractStreamId - On-chain stream id in the escrow
+ * @param {string} [params.senderSecret] - REJECTED; must not be provided
  * @param {string} [params.assetCode='XLM'] - Asset code to stream
  * @param {number} params.rateAmount - Amount sent per interval
  * @param {number} [params.intervalSeconds=60] - Seconds between each payment
  * @param {string|null} [params.endTime] - ISO date string at which the stream stops
  * @param {object} [params.metadata={}] - Arbitrary metadata attached to the stream record
+ * @param {string|number} [params.allowance] - Escrowed allowance
  * @returns {Promise<import('@prisma/client').PaymentStream>} The newly created stream record
- * @throws {Error} If senderSecret is not provided or Prisma write fails
- * @example
- * const stream = await createStream({
- *   senderPublicKey: 'GABC...',
- *   senderSecret: 'SABC...',
- *   recipientPublicKey: 'GXYZ...',
- *   rateAmount: 1,
- *   intervalSeconds: 3600,
- * });
  */
-export async function createStream({ senderPublicKey, senderSecret, recipientPublicKey, assetCode, rateAmount, intervalSeconds = 60, endTime, metadata }) {
-  if (!senderSecret) throw new Error('senderSecret is required to create a stream');
+export async function createStream({
+  senderPublicKey,
+  senderSecret,
+  recipientPublicKey,
+  assetCode,
+  rateAmount,
+  intervalSeconds = 60,
+  endTime,
+  metadata,
+  escrowContractId,
+  contractStreamId,
+  allowance,
+}) {
+  if (senderSecret) {
+    const err = new Error(
+      'senderSecret is no longer accepted; use delegated Soroban escrow (escrowContractId + contractStreamId)',
+    );
+    err.code = 'CUSTODIAL_SECRET_REJECTED';
+    throw err;
+  }
+
+  const delegated = await createDelegatedStreamEscrow({
+    senderPublicKey,
+    recipientPublicKey,
+    escrowContractId,
+    contractStreamId,
+    rateAmount,
+    intervalSeconds,
+    allowance,
+  });
 
   // Ensure users exist
   const [sender, recipient] = await Promise.all([
@@ -110,8 +123,6 @@ export async function createStream({ senderPublicKey, senderSecret, recipientPub
     throw err;
   }
 
-  const encryptedSecret = encryptToEnvValue(senderSecret, getStreamEncryptionKey());
-
   const stream = await prisma.paymentStream.create({
     data: {
       senderId: sender.id,
@@ -122,18 +133,22 @@ export async function createStream({ senderPublicKey, senderSecret, recipientPub
       endTime: endTime ? new Date(endTime) : null,
       metadata: metadata || {},
       status: 'ACTIVE',
-      senderSecret: encryptedSecret,
+      senderSecret: null,
+      escrowContractId: delegated.escrowContractId,
+      contractStreamId: delegated.contractStreamId,
     },
   });
 
   await eventMonitor.publishEvent(senderPublicKey, {
     type: 'StreamCreated',
-    data: { 
-      streamId: stream.id, 
-      recipientPublicKey, 
+    data: {
+      streamId: stream.id,
+      recipientPublicKey,
       assetCode: assetCode || 'XLM',
-      rateAmount, 
-      intervalSeconds 
+      rateAmount,
+      intervalSeconds,
+      escrowContractId: delegated.escrowContractId,
+      contractStreamId: delegated.contractStreamId,
     },
     version: 1,
   });
@@ -284,11 +299,75 @@ export async function updateStream(id, updates) {
   return updated;
 }
 
+
 /**
  * Return aggregate analytics across all payment streams.
  * @returns {Promise<{totalVolume: string, activeStreams: number, pausedStreams: number, failedStreams: number, completedStreams: number, cancelledStreams: number, totalStreams: number, topAssets: Array<{assetCode: string, count: number}>}>}
  */
-exp
+export async function getStreamAnalytics() {
+  const [statusCounts, totalVolumeResult, assets] = await Promise.all([
+    prisma.paymentStream.groupBy({
+      by: ['status'],
+      _count: true,
+    }),
+    prisma.paymentStream.aggregate({
+      _sum: { totalStreamed: true },
+    }),
+    prisma.paymentStream.groupBy({
+      by: ['assetCode'],
+      _count: true,
+      orderBy: { _count: { assetCode: 'desc' } },
+      take: 10,
+    }),
+  ]);
+
+  const statusMap = statusCounts.reduce((acc, { status, _count }) => {
+    acc[status] = _count;
+    return acc;
+  }, {});
+
+  return {
+    totalVolume: (totalVolumeResult._sum.totalStreamed || 0).toFixed(7),
+    activeStreams: statusMap.ACTIVE || 0,
+    pausedStreams: statusMap.PAUSED || 0,
+    failedStreams: statusMap.FAILED || 0,
+    completedStreams: statusMap.COMPLETED || 0,
+    cancelledStreams: statusMap.CANCELLED || 0,
+    totalStreams: Object.values(statusMap).reduce((a, b) => a + b, 0),
+    topAssets: assets.map(a => ({ assetCode: a.assetCode, count: a._count })),
+  };
+}
+
+/**
+ * Return the failure history for a given stream, most recent first.
+ * @param {string} id - Primary key of the PaymentStream record
+ * @returns {Promise<Array<{id: string, streamId: string, reason: string, createdAt: Date}>>}
+ */
+export async function getStreamFailures(id) {
+  return prisma.streamFailure.findMany({
+    where: { streamId: id },
+    orderBy: { createdAt: 'desc' },
+  });
+}
+
+/**
+ * Worker tick: find all ACTIVE streams whose interval has elapsed and execute the next payment.
+ * Streams that fail 5 consecutive times are automatically set to FAILED status.
+ * Intended to be called by a scheduled job (e.g. every 10–30 seconds).
+ * @returns {Promise<void>}
+ */
+export async function processActiveStreams() {
+  const now = new Date();
+  const activeStreams = await prisma.paymentStream.findMany({
+    where: {
+      status: 'ACTIVE',
+      OR: [
+        { endTime: null },
+        { endTime: { gt: now } },
+      ],
+    },
+    include: { sender: true, recipient: true },
+  });
 
   logger.debug('streaming.worker.tick', { activeCount: activeStreams.length });
 
@@ -317,19 +396,13 @@ exp
        }
 
        try {
-         if (!stream.senderSecret) {
-           throw new Error('Stream has no senderSecret — cannot sign transaction');
+         if (!stream.escrowContractId || !stream.contractStreamId) {
+           throw new Error('Stream missing delegated escrow references — cannot tick without user secret storage');
          }
-         const senderSecret = decryptFromEnvValue(stream.senderSecret, getStreamEncryptionKey());
 
-         // Execute payment on Stellar using the actual sender's secret
-         const result = await sendPayment(
-           senderSecret,
-           stream.recipient.publicKey, 
-           stream.rateAmount.toString(), 
-           stream.assetCode
-         );
-         
+         // Release one interval from Soroban escrow — no user private key involved
+         const result = await tickStreamPayment(stream.escrowContractId, stream.contractStreamId);
+
          if (result.success) {
            await prisma.paymentStream.update({
              where: { id: stream.id },
@@ -390,4 +463,3 @@ exp
     }
   }
 }
-/* … truncated 5126 chars — edit only what you need near the top … */

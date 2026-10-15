@@ -125,7 +125,12 @@ model PaymentStream {
   status          StreamStatus   @default(ACTIVE)
   failureCount    Int            @default(0)
   metadata        Json?
+  /// DEPRECATED: never stored. Kept nullable for migration compatibility; always null.
   senderSecret    String?
+  /// Soroban StreamPayment contract address (C...) holding escrowed allowance.
+  escrowContractId String?
+  /// On-chain stream id within the escrow contract.
+  contractStreamId String?
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
   failures        StreamFailure[]
