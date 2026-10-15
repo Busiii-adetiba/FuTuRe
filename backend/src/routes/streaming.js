@@ -36,7 +36,15 @@ const streamRules = {
     body('senderPublicKey').matches(STELLAR_PUBLIC_KEY).withMessage('Invalid sender public key'),
     body('recipientPublicKey').matches(STELLAR_PUBLIC_KEY).withMessage('Invalid recipient public key'),
     body('assetCode').optional().isString().isLength({ min: 1, max: 12 }),
-    body('rateAmount').isFloat({ gt: 0 }).withMessage('rateAmount must be a positive number'),
+    body('rateAmount')
+      .isFloat({ min: 0.00001 })
+      .withMessage('rateAmount must be at least 0.00001')
+      .custom((value) => {
+        if (!/^\d+(\.\d{1,7})?$/.test(String(value))) {
+          throw new Error('rateAmount cannot exceed 7 decimal places (1 stroop)');
+        }
+        return true;
+      }),
     body('intervalSeconds').optional().isInt({ min: 10 }).withMessage('intervalSeconds must be at least 10'),
     body('endTime').optional().isISO8601().withMessage('endTime must be a valid ISO8601 date'),
     body('escrowContractId').isString().notEmpty().withMessage('escrowContractId is required for delegated streaming'),
@@ -102,7 +110,11 @@ router.post('/', idempotencyMiddleware, streamRules.create, validate, async (req
     if (error.code === 'STREAM_LIMIT_EXCEEDED') {
       return res.status(429).json({ error: error.message });
     }
-    if (error.code === 'CUSTODIAL_SECRET_REJECTED' || error.code === 'DELEGATED_STREAM_REQUIRED') {
+    if (
+      error.code === 'CUSTODIAL_SECRET_REJECTED' ||
+      error.code === 'DELEGATED_STREAM_REQUIRED' ||
+      error.code === 'RATE_AMOUNT_INVALID'
+    ) {
       return res.status(400).json({ error: error.message, code: error.code });
     }
     res.status(500).json({ error: error.message });

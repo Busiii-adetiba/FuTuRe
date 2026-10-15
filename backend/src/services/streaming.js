@@ -60,6 +60,33 @@ async function claimStreamInterval(stream, now) {
  * See STREAMING_SECURITY.md
  */
 
+/** Minimum stream rate per interval (avoids dust txs that cost more in fees than value). */
+export const MIN_STREAM_RATE_AMOUNT = 0.00001;
+
+/**
+ * Validate rateAmount against Stellar SDK constraints (≤7 decimal places / 1 stroop)
+ * and a sensible minimum to avoid fee-exceeding dust payments.
+ * @param {string|number} rateAmount
+ * @throws {Error} with code RATE_AMOUNT_INVALID
+ */
+export function validateRateAmount(rateAmount) {
+  const raw = String(rateAmount).trim();
+  if (!/^\d+(\.\d{1,7})?$/.test(raw)) {
+    const err = new Error('rateAmount cannot exceed 7 decimal places (1 stroop)');
+    err.code = 'RATE_AMOUNT_INVALID';
+    throw err;
+  }
+  const value = parseFloat(raw);
+  if (!(value >= MIN_STREAM_RATE_AMOUNT)) {
+    const err = new Error(
+      `rateAmount must be at least ${MIN_STREAM_RATE_AMOUNT} to avoid dust payments`,
+    );
+    err.code = 'RATE_AMOUNT_INVALID';
+    throw err;
+  }
+  return value;
+}
+
 /**
  * Create a new recurring payment stream backed by Soroban escrow (no stored secrets).
  * @param {object} params
@@ -96,6 +123,8 @@ export async function createStream({
     err.code = 'CUSTODIAL_SECRET_REJECTED';
     throw err;
   }
+
+  rateAmount = validateRateAmount(rateAmount);
 
   const delegated = await createDelegatedStreamEscrow({
     senderPublicKey,
@@ -280,7 +309,7 @@ export async function updateStream(id, updates) {
   }
 
   const updateData = {};
-  if (updates.rateAmount !== undefined) updateData.rateAmount = updates.rateAmount;
+  if (updates.rateAmount !== undefined) updateData.rateAmount = validateRateAmount(updates.rateAmount);
   if (updates.intervalSeconds !== undefined) updateData.intervalSeconds = updates.intervalSeconds;
   if (updates.endTime !== undefined) updateData.endTime = updates.endTime ? new Date(updates.endTime) : null;
 
