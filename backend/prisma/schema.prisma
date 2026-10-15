@@ -121,6 +121,8 @@ model PaymentStream {
   startTime       DateTime       @default(now())
   endTime         DateTime?
   lastProcessedAt DateTime       @default(now())
+  /// When set, worker skips the stream until this timestamp (failure backoff).
+  nextAttemptAt   DateTime?
   totalStreamed    Decimal        @default(0)
   status          StreamStatus   @default(ACTIVE)
   failureCount    Int            @default(0)
@@ -138,6 +140,7 @@ model PaymentStream {
   @@index([senderId])
   @@index([recipientId])
   @@index([status, lastProcessedAt])
+  @@index([status, nextAttemptAt])
 }
 
 model StreamFailure {

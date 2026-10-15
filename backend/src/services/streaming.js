@@ -222,7 +222,7 @@ export async function resumeStream(id) {
 
   const updated = await prisma.paymentStream.update({
     where: { id },
-    data: { status: 'ACTIVE', lastProcessedAt: new Date(), failureCount: 0 },
+    data: { status: 'ACTIVE', lastProcessedAt: new Date(), failureCount: 0, nextAttemptAt: null },
     include: { sender: true },
   });
 
@@ -390,9 +390,19 @@ export async function processActiveStreams() {
   const activeStreams = await prisma.paymentStream.findMany({
     where: {
       status: 'ACTIVE',
-      OR: [
-        { endTime: null },
-        { endTime: { gt: now } },
+      AND: [
+        {
+          OR: [
+            { endTime: null },
+            { endTime: { gt: now } },
+          ],
+        },
+        {
+          OR: [
+            { nextAttemptAt: null },
+            { nextAttemptAt: { lte: now } },
+          ],
+        },
       ],
     },
     include: { sender: true, recipient: true },
@@ -438,6 +448,7 @@ export async function processActiveStreams() {
              data: {
                totalStreamed: { increment: stream.rateAmount },
                failureCount: 0,
+               nextAttemptAt: null,
              },
            });
 
@@ -461,6 +472,17 @@ export async function processActiveStreams() {
          const updatedStream = await prisma.paymentStream.update({
            where: { id: stream.id },
            data: { failureCount: { increment: 1 } },
+         });
+
+         // Exponential backoff so transient Horizon errors do not burn retries
+         // on consecutive 10s worker ticks.
+         const backoffSeconds = Math.min(
+           Math.max(stream.intervalSeconds, 60 * Math.pow(2, updatedStream.failureCount - 1)),
+           3600,
+         );
+         await prisma.paymentStream.update({
+           where: { id: stream.id },
+           data: { nextAttemptAt: new Date(Date.now() + backoffSeconds * 1000) },
          });
 
          if (updatedStream.failureCount >= 3) {
