@@ -121,11 +121,18 @@ model PaymentStream {
   startTime       DateTime       @default(now())
   endTime         DateTime?
   lastProcessedAt DateTime       @default(now())
+  /// When set, worker skips the stream until this timestamp (failure backoff).
+  nextAttemptAt   DateTime?
   totalStreamed    Decimal        @default(0)
   status          StreamStatus   @default(ACTIVE)
   failureCount    Int            @default(0)
   metadata        Json?
+  /// DEPRECATED: never stored. Kept nullable for migration compatibility; always null.
   senderSecret    String?
+  /// Soroban StreamPayment contract address (C...) holding escrowed allowance.
+  escrowContractId String?
+  /// On-chain stream id within the escrow contract.
+  contractStreamId String?
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
   failures        StreamFailure[]
@@ -133,6 +140,7 @@ model PaymentStream {
   @@index([senderId])
   @@index([recipientId])
   @@index([status, lastProcessedAt])
+  @@index([status, nextAttemptAt])
 }
 
 model StreamFailure {

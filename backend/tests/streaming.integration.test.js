@@ -36,6 +36,19 @@ vi.mock('../src/db/client.js', () => {
           mockStreams.push(stream);
           return Promise.resolve(stream);
         }),
+        updateMany: vi.fn(({ where, data }) => {
+          const index = mockStreams.findIndex(s => s.id === where.id);
+          if (index === -1) return Promise.resolve({ count: 0 });
+          if (where.status && mockStreams[index].status !== where.status) {
+            return Promise.resolve({ count: 0 });
+          }
+          if (where.lastProcessedAt !== undefined &&
+              String(mockStreams[index].lastProcessedAt) !== String(where.lastProcessedAt)) {
+            return Promise.resolve({ count: 0 });
+          }
+          Object.assign(mockStreams[index], data);
+          return Promise.resolve({ count: 1 });
+        }),
         update: vi.fn(({ where, data }) => {
           const index = mockStreams.findIndex(s => s.id === where.id);
           if (index === -1) return Promise.reject(new Error('Not found'));
@@ -120,6 +133,15 @@ vi.mock('../src/config/secrets.js', () => ({
   decryptFromEnvValue: vi.fn((val) => val.replace('enc:', '')),
 }));
 
+vi.mock('../src/services/streamContract.js', () => ({
+  createDelegatedStreamEscrow: vi.fn(async ({ escrowContractId, contractStreamId }) => ({
+    escrowContractId,
+    contractStreamId: String(contractStreamId),
+    delegated: true,
+  })),
+  tickStreamPayment: vi.fn(() => Promise.resolve({ success: true, hash: 'tick-hash-' + Math.random() })),
+}));
+
 // Import app AFTER mocks
 const { default: app } = await import('./helpers/full-app.js');
 const StreamingService = await import('../src/services/streaming.js');
@@ -136,6 +158,8 @@ describe('Streaming Payments Integration', () => {
         recipientPublicKey: recipientKey,
         rateAmount: 0.1,
         intervalSeconds: 60,
+        escrowContractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHLQN',
+        contractStreamId: '1',
       });
 
     expect(res.status).toBe(201);
@@ -182,7 +206,7 @@ describe('Streaming Payments Integration', () => {
 });
 
 describe('Stream failure escalation', () => {
-  const { sendPayment } = await import('../src/services/stellar.js');
+  const { tickStreamPayment } = await import('../src/services/streamContract.js');
   const webPush = await import('../src/notifications/webPush.js');
 
   const STREAM_FAIL_ID     = 'aaaaaaaa-0001-4000-a000-000000000001';
@@ -198,7 +222,7 @@ describe('Stream failure escalation', () => {
   });
 
   it('marks a stream FAILED after 3 consecutive failures and sends push notification', async () => {
-    sendPayment.mockRejectedValue(new Error('insufficient balance'));
+    tickStreamPayment.mockRejectedValue(new Error('insufficient balance'));
 
     const stream = {
       id: STREAM_FAIL_ID,
@@ -208,7 +232,9 @@ describe('Stream failure escalation', () => {
       intervalSeconds: 60,
       rateAmount: 1,
       assetCode: 'XLM',
-      senderSecret: 'enc:STEST',
+      senderSecret: null,
+      escrowContractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHLQN',
+      contractStreamId: '1',
       sender: mockUsers[0],
       recipient: mockUsers[1],
       endTime: null,
@@ -233,7 +259,7 @@ describe('Stream failure escalation', () => {
   });
 
   it('includes the failure reason in the push notification', async () => {
-    sendPayment.mockRejectedValue(new Error('account not found'));
+    tickStreamPayment.mockRejectedValue(new Error('account not found'));
 
     const stream = {
       id: STREAM_REASON_ID,
@@ -243,7 +269,9 @@ describe('Stream failure escalation', () => {
       intervalSeconds: 60,
       rateAmount: 1,
       assetCode: 'XLM',
-      senderSecret: 'enc:STEST',
+      senderSecret: null,
+      escrowContractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHLQN',
+      contractStreamId: '1',
       sender: mockUsers[0],
       recipient: mockUsers[1],
       endTime: null,
@@ -258,7 +286,7 @@ describe('Stream failure escalation', () => {
   });
 
   it('records each failure in StreamFailure table', async () => {
-    sendPayment.mockRejectedValue(new Error('tx failed'));
+    tickStreamPayment.mockRejectedValue(new Error('tx failed'));
 
     const stream = {
       id: STREAM_RECORD_ID,
@@ -268,7 +296,9 @@ describe('Stream failure escalation', () => {
       intervalSeconds: 60,
       rateAmount: 1,
       assetCode: 'XLM',
-      senderSecret: 'enc:STEST',
+      senderSecret: null,
+      escrowContractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHLQN',
+      contractStreamId: '1',
       sender: mockUsers[0],
       recipient: mockUsers[1],
       endTime: null,
@@ -355,7 +385,8 @@ describe('Stream creation rate limiting (#541)', () => {
     const res = await request(app).post('/api/streaming').send({
       senderPublicKey: senderKey,
       recipientPublicKey: recipientKey,
-      senderSecret: 'SCZANGBA5RLKJNMDBJKTA7LCMNSZXJVLCMSBXOLQXGAEOP7SKNU4PX2',
+      escrowContractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHLQN',
+        contractStreamId: '99',
       rateAmount: 0.1,
       intervalSeconds: 60,
     });
@@ -378,7 +409,8 @@ describe('Stream creation rate limiting (#541)', () => {
     const res = await request(app).post('/api/streaming').send({
       senderPublicKey: senderKey,
       recipientPublicKey: recipientKey,
-      senderSecret: 'SCZANGBA5RLKJNMDBJKTA7LCMNSZXJVLCMSBXOLQXGAEOP7SKNU4PX2',
+      escrowContractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHLQN',
+        contractStreamId: '99',
       rateAmount: 0.1,
       intervalSeconds: 60,
     });
@@ -407,7 +439,8 @@ describe('Stream creation rate limiting (#541)', () => {
     const res = await request(app).post('/api/streaming').send({
       senderPublicKey: senderKey,
       recipientPublicKey: recipientKey,
-      senderSecret: 'SCZANGBA5RLKJNMDBJKTA7LCMNSZXJVLCMSBXOLQXGAEOP7SKNU4PX2',
+      escrowContractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHLQN',
+        contractStreamId: '99',
       rateAmount: 0.1,
       intervalSeconds: 60,
     });
