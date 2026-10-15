@@ -202,25 +202,15 @@ router.get('/queue', requireMobileAuth, (req, res) => {
   res.json(offlineQueue.getQueue(req.mobile.userId));
 });
 
-/** POST /api/mobile/queue/flush — process all pending queued transactions */
+/** POST /api/mobile/queue/flush — process pending txs with sequence pre-flight */
 router.post('/queue/flush', requireMobileAuth, async (req, res) => {
-  const pending = offlineQueue.getQueue(req.mobile.userId).filter(i => i.status === 'pending');
-  const results = [];
-
-  for (const item of pending) {
-    try {
-      const { sourceSecret, destination, amount, assetCode } = item.transaction;
-      const result = await StellarService.sendPayment(sourceSecret, destination, amount, assetCode);
-      offlineQueue.updateStatus(req.mobile.userId, item.id, 'success', result);
-      results.push({ id: item.id, status: 'success', hash: result.hash });
-    } catch (e) {
-      offlineQueue.updateStatus(req.mobile.userId, item.id, 'failed', { error: e.message });
-      results.push({ id: item.id, status: 'failed', error: e.message });
-    }
+  try {
+    const outcome = await offlineQueue.flushQueue(req.mobile.userId);
+    const status = outcome.requiresResign ? 409 : 200;
+    res.status(status).json(outcome);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  offlineQueue.clearProcessed(req.mobile.userId);
-  res.json({ processed: results.length, results });
 });
 
 // ─── Security ─────────────────────────────────────────────────────────────────
