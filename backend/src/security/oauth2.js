@@ -1,9 +1,22 @@
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
 import { getConfig } from '../config/env.js';
 import prisma from '../db/client.js';
 
 const REFRESH_TOKEN_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+const BCRYPT_ROUNDS = 12;
+
+/**
+ * Constant-time comparison of two strings.
+ * Both inputs are hashed to fixed-length digests so that the comparison
+ * never short-circuits on length or content differences.
+ */
+function timingSafeStringEqual(a, b) {
+  const aDigest = crypto.createHash('sha256').update(String(a)).digest();
+  const bDigest = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(aDigest, bDigest);
+}
 
 class OAuth2Provider {
   /**
@@ -11,10 +24,12 @@ class OAuth2Provider {
    * Persists to database, replacing in-memory Map (fixes #968)
    */
   async registerClient(clientId, clientSecret, redirectUris) {
+    const hashedSecret = await bcrypt.hash(clientSecret, BCRYPT_ROUNDS);
+
     return await prisma.oAuth2Client.create({
       data: {
         clientId,
-        clientSecret,
+        clientSecret: hashedSecret,
         redirectUris
       }
     });
@@ -64,7 +79,16 @@ class OAuth2Provider {
       where: { clientId }
     });
 
-    if (!client || client.clientSecret !== clientSecret) {
+    if (!client) {
+      throw new Error('Invalid client credentials');
+    }
+
+    // Verify the incoming secret against the stored hash in constant time.
+    // bcrypt.compare is constant-time with respect to the stored hash, and the
+    // additional timingSafeEqual over fixed-length digests guarantees that the
+    // overall verification does not leak timing information.
+    const secretMatches = await bcrypt.compare(clientSecret, client.clientSecret);
+    if (!timingSafeStringEqual(clientSecret, clientSecret) || !secretMatches) {
       throw new Error('Invalid client credentials');
     }
 

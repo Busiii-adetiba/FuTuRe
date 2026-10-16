@@ -149,6 +149,65 @@ describe('Security Features', () => {
     });
   });
 
+  describe('Threat Detector memory behavior', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      threatDetector.requestTracker.clear();
+      threatDetector.anomalyScores.clear();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      threatDetector.requestTracker.clear();
+      threatDetector.anomalyScores.clear();
+    });
+
+    it('evicts inactive IPs after the evaluation window expires', () => {
+      const ipCount = 500;
+      for (let i = 0; i < ipCount; i++) {
+        threatDetector.recordRequest(`10.0.${Math.floor(i / 256)}.${i % 256}`);
+      }
+      expect(threatDetector.requestTracker.size).toBe(ipCount);
+
+      // Advance time well past the evaluation window and run the sweep.
+      vi.advanceTimersByTime(60 * 60 * 1000);
+      threatDetector.cleanup();
+
+      expect(threatDetector.requestTracker.size).toBe(0);
+      expect(threatDetector.anomalyScores.size).toBe(0);
+      expect([...threatDetector.requestTracker.keys()]).toHaveLength(0);
+      expect([...threatDetector.anomalyScores.keys()]).toHaveLength(0);
+    });
+
+    it('keeps map sizes bounded under continuous unique-IP traffic', () => {
+      const windowMs = threatDetector.windowMs ?? 60 * 1000;
+      const batchSize = 100;
+      const batches = 20;
+
+      for (let b = 0; b < batches; b++) {
+        for (let i = 0; i < batchSize; i++) {
+          threatDetector.recordRequest(`10.1.${b}.${i}`);
+        }
+        // Advance beyond the window so older IPs become stale.
+        vi.advanceTimersByTime(windowMs + 1000);
+        threatDetector.cleanup();
+      }
+
+      // After each sweep, only the most recent batch should remain.
+      expect(threatDetector.requestTracker.size).toBeLessThanOrEqual(batchSize);
+      expect(threatDetector.anomalyScores.size).toBeLessThanOrEqual(batchSize);
+    });
+
+    it('does not keep the process alive via the cleanup timer', () => {
+      const timer = threatDetector.cleanupTimer ?? threatDetector._cleanupTimer;
+      expect(timer).toBeDefined();
+      // A timer with unref() returns the timer object; hasRef() should be false.
+      if (typeof timer.hasRef === 'function') {
+        expect(timer.hasRef()).toBe(false);
+      }
+    });
+  });
+
   describe('Security Scanner', () => {
     it('should scan dependencies', async () => {
       const scan = await securityScanner.scanDependencies();

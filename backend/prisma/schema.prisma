@@ -361,7 +361,10 @@ model AdminAuditLog {
 model OAuth2Client {
   id           String   @id @default(uuid())
   clientId     String   @unique
-  clientSecret String
+  /// bcrypt/argon2id hash of the client secret. Never store the raw secret.
+  /// Existing plaintext values must be converted to hashes by the migration
+  /// before this column is used for authentication (see oauth2.js).
+  clientSecretHash String
   redirectUris String[]
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt

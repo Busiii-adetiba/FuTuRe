@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import http from 'http';
+import https from 'https';
 import {
   failureInjector,
   networkPartitionSimulator,
@@ -34,11 +36,61 @@ describe('Chaos Engineering', () => {
   });
 
   describe('FailureInjector', () => {
+    const CANARY_HEADERS = {
+      'x-chaos-experiment-id': 'exp-test-1',
+      'x-canary-test': 'true'
+    };
+
     it('should inject latency', () => {
       failureInjector.removeAllInjections();
       const injection = failureInjector.injectLatency('api-1', 500, 1.0);
       expect(injection.type).toBe('LATENCY');
       expect(injection.delayMs).toBe(500);
+    });
+
+    it('should never disrupt requests without valid canary headers regardless of probability', () => {
+      failureInjector.removeAllInjections();
+      failureInjector.injectError('api-1', 100, 500);
+      failureInjector.injectLatency('api-1', 5000, 1.0);
+
+      const decision = failureInjector.shouldInjectFailure('api-1', {});
+      expect(decision.inject).toBe(false);
+
+      const decision2 = failureInjector.shouldInjectFailure('api-1', {
+        headers: { 'x-canary-test': 'true' }
+      });
+      expect(decision2.inject).toBe(false);
+
+      const decision3 = failureInjector.shouldInjectFailure('api-1', {
+        headers: { 'x-chaos-experiment-id': 'exp-1' }
+      });
+      expect(decision3.inject).toBe(false);
+    });
+
+    it('should unconditionally reject injection on protected endpoints', () => {
+      failureInjector.removeAllInjections();
+      failureInjector.injectError('api-1', 100, 500);
+
+      const protectedPaths = ['/api/transactions/submit', '/api/recovery/execute'];
+      for (const p of protectedPaths) {
+        const decision = failureInjector.shouldInjectFailure('api-1', {
+          path: p,
+          headers: CANARY_HEADERS
+        });
+        expect(decision.inject).toBe(false);
+        expect(decision.reason).toMatch(/protected/i);
+      }
+    });
+
+    it('should still inject for valid canary requests on non-protected endpoints', () => {
+      failureInjector.removeAllInjections();
+      failureInjector.injectError('api-1', 100, 500);
+
+      const decision = failureInjector.shouldInjectFailure('api-1', {
+        path: '/api/orders',
+        headers: CANARY_HEADERS
+      });
+      expect(decision.inject).toBe(true);
     });
 
     it('should inject errors', () => {
@@ -68,6 +120,10 @@ describe('Chaos Engineering', () => {
   });
 
   describe('NetworkPartitionSimulator', () => {
+    afterEach(() => {
+      networkPartitionSimulator.teardown();
+    });
+
     it('should create partition', () => {
       const partition = networkPartitionSimulator.createPartition('part-1', ['api', 'db']);
       expect(partition.id).toBe('part-1');
@@ -84,6 +140,114 @@ describe('Chaos Engineering', () => {
       networkPartitionSimulator.healPartition('part-1');
       
       expect(networkPartitionSimulator.isPartitioned('api', 'db')).toBe(false);
+    });
+
+    it('should never block non-targeted requests (health checks, logging)', () => {
+      networkPartitionSimulator.createPartition('part-1', ['api', 'db'], {
+        hosts: ['targeted.example.com'],
+        ports: [8080]
+      });
+
+      const health = networkPartitionSimulator.shouldBlockRequest({
+        hostname: 'health.internal',
+        port: 80,
+        path: '/healthz'
+      });
+      expect(health.blocked).toBe(false);
+
+      const logging = networkPartitionSimulator.shouldBlockRequest({
+        hostname: 'logs.internal',
+        port: 514,
+        path: '/ingest'
+      });
+      expect(logging.blocked).toBe(false);
+    });
+
+    it('should only affect requests matching configured hosts/ports', () => {
+      networkPartitionSimulator.createPartition('part-1', ['api', 'db'], {
+        hosts: ['targeted.example.com'],
+        ports: [8080]
+      });
+
+      const targeted = networkPartitionSimulator.shouldBlockRequest({
+        hostname: 'targeted.example.com',
+        port: 8080,
+        path: '/api/data'
+      });
+      expect(targeted.blocked).toBe(true);
+
+      const wrongPort = networkPartitionSimulator.shouldBlockRequest({
+        hostname: 'targeted.example.com',
+        port: 9090,
+        path: '/api/data'
+      });
+      expect(wrongPort.blocked).toBe(false);
+
+      const wrongHost = networkPartitionSimulator.shouldBlockRequest({
+        hostname: 'other.example.com',
+        port: 8080,
+        path: '/api/data'
+      });
+      expect(wrongHost.blocked).toBe(false);
+    });
+
+    it('should affect requests carrying the X-Chaos-Context header', () => {
+      networkPartitionSimulator.createPartition('part-1', ['api', 'db'], {
+        hosts: ['targeted.example.com'],
+        ports: [8080]
+      });
+
+      const withContext = networkPartitionSimulator.shouldBlockRequest({
+        hostname: 'unrelated.example.com',
+        port: 1234,
+        path: '/api/data',
+        headers: { 'x-chaos-context': 'exp-1' }
+      });
+      expect(withContext.blocked).toBe(true);
+
+      const withoutContext = networkPartitionSimulator.shouldBlockRequest({
+        hostname: 'unrelated.example.com',
+        port: 1234,
+        path: '/api/data',
+        headers: {}
+      });
+      expect(withoutContext.blocked).toBe(false);
+    });
+
+    it('should not monkey-patch global http/https networking modules', () => {
+      const originalHttpRequest = http.request;
+      const originalHttpsRequest = https.request;
+
+      networkPartitionSimulator.createPartition('part-1', ['api', 'db'], {
+        hosts: ['targeted.example.com'],
+        ports: [8080]
+      });
+
+      expect(http.request).toBe(originalHttpRequest);
+      expect(https.request).toBe(originalHttpsRequest);
+    });
+
+    it('should teardown and remove all interceptors without side effects', () => {
+      const originalHttpRequest = http.request;
+      const originalHttpsRequest = https.request;
+
+      networkPartitionSimulator.createPartition('part-1', ['api', 'db'], {
+        hosts: ['targeted.example.com'],
+        ports: [8080]
+      });
+
+      networkPartitionSimulator.teardown();
+
+      expect(http.request).toBe(originalHttpRequest);
+      expect(https.request).toBe(originalHttpsRequest);
+
+      const afterTeardown = networkPartitionSimulator.shouldBlockRequest({
+        hostname: 'targeted.example.com',
+        port: 8080,
+        path: '/api/data',
+        headers: { 'x-chaos-context': 'exp-1' }
+      });
+      expect(afterTeardown.blocked).toBe(false);
     });
   });
 
